@@ -508,6 +508,116 @@ select pg_temp.rejects(
   'a deliverable with no order item is rejected');
 
 -- =============================================================================
+-- Composite tenancy keys hold without the trigger
+-- =============================================================================
+-- The trigger enforces a rule; the foreign key makes the rule unrepresentable.
+-- This test removes the trigger and proves the constraint still stands, which
+-- is the whole reason for having both.
+
+do $$
+begin
+  alter table public.captures disable trigger captures_org_guard;
+end;
+$$;
+
+select pg_temp.rejects(
+  $q$ insert into public.captures
+        (event_id, device_id, device_sequence, captured_at, organization_id)
+      values ('00000000-0000-0000-0000-00000000a001',
+              '00000000-0000-0000-0000-00000000a002', 97, now(),
+              '00000000-0000-0000-0000-00000000b000') $q$,
+  'the composite FK rejects mismatched tenancy even with the trigger disabled');
+
+do $$
+begin
+  alter table public.captures enable trigger captures_org_guard;
+end;
+$$;
+
+-- A device cannot be used against another organization's event, which was
+-- previously an application-layer concern only.
+select pg_temp.rejects(
+  $q$ insert into public.device_sessions (device_id, event_id, expires_at)
+      values ('00000000-0000-0000-0000-00000000a002',
+              '00000000-0000-0000-0000-00000000b001', now() + interval '8 hours') $q$,
+  'a device cannot open a session against another organization''s event');
+
+-- =============================================================================
+-- Order access tokens  (single use, scoped, hashed)
+-- =============================================================================
+
+update public.orders set contact_email = 'buyer@example.test', contact_email_source = 'checkout'
+ where id = '00000000-0000-0000-0000-0000000000e1';
+
+insert into public.order_access_tokens
+  (id, organization_id, order_id, token_hash, issued_to_email, expires_at)
+values
+  ('00000000-0000-0000-0000-00000000a7a1', '00000000-0000-0000-0000-00000000a000',
+   '00000000-0000-0000-0000-0000000000e1', digest('raw-token-one','sha256'),
+   'buyer@example.test', now() + interval '72 hours');
+
+do $$
+declare v_session uuid; n integer;
+begin
+  v_session := app.consume_order_access_token(digest('raw-token-one','sha256'), '203.0.113.0'::inet);
+  perform pg_temp.ok(v_session is not null, 'a valid order access token mints a session');
+
+  -- The bootstrapped session reaches the order it was issued for.
+  select count(*) into n
+  from app.authorize_download(v_session, '00000000-0000-0000-0000-0000000000c1');
+  perform pg_temp.ok(n = 1, 'a token-scoped session can download its own order''s photograph');
+
+  -- ...and is scoped to that order only.
+  select count(*) into n from public.customer_sessions
+   where id = v_session and order_scope_id = '00000000-0000-0000-0000-0000000000e1';
+  perform pg_temp.ok(n = 1, 'the bootstrapped session is scoped to exactly one order');
+end;
+$$;
+
+select pg_temp.rejects(
+  $q$ select app.consume_order_access_token(digest('raw-token-one','sha256')) $q$,
+  'an order access token cannot be consumed twice');
+
+insert into public.order_access_tokens
+  (organization_id, order_id, token_hash, issued_to_email, issued_at, expires_at)
+values
+  ('00000000-0000-0000-0000-00000000a000', '00000000-0000-0000-0000-0000000000e1',
+   digest('raw-token-stale','sha256'), 'buyer@example.test',
+   now() - interval '10 days', now() - interval '3 days');
+
+select pg_temp.rejects(
+  $q$ select app.consume_order_access_token(digest('raw-token-stale','sha256')) $q$,
+  'an expired order access token is refused');
+
+insert into public.order_access_tokens
+  (organization_id, order_id, token_hash, issued_to_email, expires_at)
+values
+  ('00000000-0000-0000-0000-00000000a000', '00000000-0000-0000-0000-0000000000e1',
+   digest('raw-token-old','sha256'), 'buyer@example.test', now() + interval '72 hours');
+
+do $$
+declare n integer;
+begin
+  n := app.supersede_order_access_tokens('00000000-0000-0000-0000-0000000000e1');
+  perform pg_temp.ok(n >= 1, 'issuing a fresh link supersedes the outstanding ones');
+end;
+$$;
+
+select pg_temp.rejects(
+  $q$ select app.consume_order_access_token(digest('raw-token-old','sha256')) $q$,
+  'a superseded order access token stops working');
+
+-- The raw token is never at rest. Only its hash is stored.
+do $$
+declare n integer;
+begin
+  select count(*) into n from public.order_access_tokens
+   where token_hash = 'raw-token-one'::bytea;
+  perform pg_temp.ok(n = 0, 'no raw order access token is stored');
+end;
+$$;
+
+-- =============================================================================
 -- Attack: cross-tenant breakout via object id substitution
 -- =============================================================================
 -- Studio B's owner authenticates honestly and then submits Studio A's ids.

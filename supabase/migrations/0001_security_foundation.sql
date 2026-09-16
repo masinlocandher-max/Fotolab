@@ -14,6 +14,11 @@
 --                    endpoint may bypass or reimplement.
 -- =============================================================================
 
+-- Supabase ships pgcrypto in the `extensions` schema; a plain Postgres puts it
+-- in `public`. Functions that need digest()/gen_random_bytes() therefore pin a
+-- fixed search_path of 'public, extensions' rather than the usual '' — still
+-- fixed, still not attacker-mutable, just resolvable in both layouts.
+create schema if not exists extensions;
 create extension if not exists "pgcrypto";
 create extension if not exists "citext";
 
