@@ -1,0 +1,367 @@
+// Advancing one capture, one step at a time.
+//
+// The pipeline is written so that stopping it at any instant is safe. Every
+// step reads its position from the database, does one externally-visible thing,
+// and commits the result. There is no in-memory progress to lose, which is why
+// `kill -9` costs at most one repeated step and never a photograph.
+
+import { readFile, stat } from 'node:fs/promises';
+import { unlink } from 'node:fs/promises';
+import { S } from './spool.js';
+import { hashStable, sha256Buffer } from './hash.js';
+import { TransientError, PermanentError, AuthorityError } from './client.js';
+
+const MAX_ATTEMPTS_BEFORE_REJECT = 12;
+// A bounded failure (checksum mismatch) gets fewer chances than a network
+// outage, which gets unlimited ones.
+const MAX_BOUNDED_ATTEMPTS = 5;
+
+export class Pipeline {
+  /**
+   * @param {object} deps
+   * @param {import('./spool.js').Spool} deps.spool
+   * @param {object} deps.client
+   * @param {object} deps.identity
+   * @param {object} deps.sessions
+   * @param {number} [deps.maxBytes] reject anything larger, rather than
+   *   discovering the limit halfway through a venue's upload window
+   */
+  constructor({ spool, client, identity, sessions, maxBytes = 512 * 1024 * 1024, log = () => {} }) {
+    this.spool = spool;
+    this.client = client;
+    this.identity = identity;
+    this.sessions = sessions;
+    this.maxBytes = maxBytes;
+    this.log = log;
+  }
+
+  /**
+   * Advance a single capture by one step.
+   * @returns {Promise<'advanced'|'idle'|'halted'>}
+   */
+  async step() {
+    const row = this.spool.claimNext();
+    if (!row) return 'idle';
+
+    try {
+      await this.#advance(row);
+      this.spool.clearFailure(row.id);
+      return 'advanced';
+    } catch (err) {
+      if (err instanceof AuthorityError) {
+        // Authority was withdrawn mid-flight. The spool is untouched: every row
+        // keeps its state and resumes if the device is re-authorised. Losing
+        // permission must never look like losing photographs.
+        this.log('authority', { code: err.code, message: err.message });
+        if (err.code === 'device_revoked' || err.code === 'device_compromised') {
+          this.identity.markRevoked(err.code === 'device_compromised' ? 'compromised' : 'revoked');
+        }
+        if (err.code?.startsWith('session')) this.sessions.clear();
+        return 'halted';
+      }
+
+      if (err instanceof PermanentError) {
+        this.spool.reject(row.id, err.code ?? 'permanent_error', { last_error: err.message });
+        this.log('rejected', { id: row.id, reason: err.code ?? err.message });
+        return 'advanced';
+      }
+
+      const attempts = this.spool.recordFailure(row.id, err);
+
+      if (err.bounded && attempts >= MAX_BOUNDED_ATTEMPTS) {
+        this.spool.reject(row.id, 'checksum_mismatch_persistent', { last_error: err.message });
+        this.log('rejected', { id: row.id, reason: 'checksum_mismatch_persistent' });
+        return 'advanced';
+      }
+      if (err.bounded) {
+        // Re-arm the upload so the next attempt actually re-sends the bytes
+        // rather than asking the server to confirm the same bad object again.
+        const rewind = { [S.UPLOADING_PREVIEW]: S.QUEUED, [S.UPLOADING_MASTER]: S.PREVIEW_CONFIRMED };
+        const back = rewind[row.state];
+        if (back) this.spool.transition(row.id, back, {});
+        return 'advanced';
+      }
+
+      if (attempts >= MAX_ATTEMPTS_BEFORE_REJECT && row.state === S.DISCOVERED) {
+        // Only local-side failures give up. A row that has reached the server
+        // keeps retrying forever: the venue's wifi will come back, and a
+        // photograph somebody may already have paid for is not ours to discard.
+        this.spool.reject(row.id, 'unreadable', { last_error: err.message });
+      }
+      this.log('retry', { id: row.id, state: row.state, attempts, error: err.message });
+      return 'advanced';
+    }
+  }
+
+  async #advance(row) {
+    switch (row.state) {
+      case S.DISCOVERED:        return this.#hash(row);
+      case S.HASHED:            return this.#announce(row);
+      case S.QUEUED:            return this.#startPreview(row);
+      case S.UPLOADING_PREVIEW: return this.#finishPreview(row);
+      case S.PREVIEW_CONFIRMED: return this.#startMaster(row);
+      case S.UPLOADING_MASTER:  return this.#finishMaster(row);
+      case S.MASTER_CONFIRMED:  return this.#complete(row);
+      default: throw new Error(`nothing to do for state ${row.state}`);
+    }
+  }
+
+  // --- DISCOVERED → HASHED --------------------------------------------------
+
+  async #hash(row) {
+    const result = await hashStable(row.master_path);
+
+    if (result.changed) {
+      // The camera or the operating system rewrote the file while we read it.
+      // The digest belongs to neither version, so it is discarded and the row
+      // waits for the file to settle again.
+      this.spool.recordFailure(row.id, new Error('file changed while hashing'));
+      return;
+    }
+    if (result.size > this.maxBytes) {
+      this.spool.reject(row.id, 'too_large', { byte_size: result.size });
+      return;
+    }
+    if (result.size === 0) {
+      this.spool.reject(row.id, 'empty_file');
+      return;
+    }
+
+    const patch = {
+      content_sha256: result.sha256,
+      byte_size: result.size,
+      observed_size: result.size,
+      observed_mtime_ms: result.mtimeMs,
+    };
+
+    if (row.preview_path && row.preview_path !== row.master_path) {
+      const p = await hashStable(row.preview_path);
+      if (p.changed) {
+        this.spool.recordFailure(row.id, new Error('preview changed while hashing'));
+        return;
+      }
+      patch.preview_sha256 = p.sha256;
+      patch.preview_size = p.size;
+    } else if (row.preview_path) {
+      patch.preview_sha256 = result.sha256;
+      patch.preview_size = result.size;
+    }
+
+    try {
+      this.spool.transition(row.id, S.HASHED, patch);
+    } catch (err) {
+      // The unique index on (event_id, content_sha256) fired: these exact bytes
+      // are already a capture in this event. One photograph, one capture.
+      if (String(err.message).includes('UNIQUE')) {
+        this.spool.reject(row.id, 'duplicate_content', { content_sha256: null });
+        this.log('duplicate', { id: row.id, path: row.master_path });
+        return;
+      }
+      throw err;
+    }
+  }
+
+  // --- HASHED → QUEUED ------------------------------------------------------
+
+  /**
+   * Announce the capture and hold on to the upload authorizations.
+   *
+   * The idempotency key was written at discovery, before any of this, so a
+   * crash between the server creating the capture and us recording its id
+   * resolves on retry to the same capture rather than to a second one.
+   */
+  async #announce(row) {
+    // Cheap guard before the digest becomes a promise to the server: if size or
+    // mtime moved since hashing, re-hash instead of announcing a stale digest.
+    try {
+      const st = await stat(row.master_path);
+      if (st.size !== row.observed_size || st.mtimeMs !== row.observed_mtime_ms) {
+        this.spool.transition(row.id, S.DISCOVERED, { last_error: 'changed before announce; re-hashing' });
+        return;
+      }
+    } catch {
+      this.spool.reject(row.id, 'vanished_before_announce');
+      return;
+    }
+
+    const res = await this.#announceRaw(row);
+    this.spool.transition(row.id, S.QUEUED, { server_capture_id: res.capture_id });
+    this.#targets.set(row.id, { ...res, at: Date.now() });
+  }
+
+  /** @type {Map<number, any>} upload targets are short-lived; never persisted. */
+  #targets = new Map();
+
+  async #announceRaw(row) {
+    const session = this.sessions.current();
+    if (!session?.token) throw new AuthorityError('no event session', { code: 'session_expired' });
+
+    try {
+      return await this.client.announceCapture({
+        idempotency_key: row.idempotency_key,
+        event_id: row.event_id,
+        device_sequence: row.device_sequence,
+        captured_at: row.captured_at,
+        content_sha256: row.content_sha256,
+        byte_size: row.byte_size,
+        preview_sha256: row.preview_sha256 ?? null,
+        preview_size: row.preview_size ?? null,
+        filename_hint: row.master_path.split('/').pop(),
+      });
+    } catch (err) {
+      // Another Bridge, or an earlier install of this one, already used this
+      // sequence number. Take the next one and retry rather than stalling.
+      if (err instanceof PermanentError && err.code === 'sequence_conflict') {
+        const next = this.spool.reassignSequence(row.id);
+        this.log('sequence-conflict', { id: row.id, newSequence: next });
+        throw new TransientError('sequence reassigned; retrying');
+      }
+      throw err;
+    }
+  }
+
+  async #freshTargets(row) {
+    const cached = this.#targets.get(row.id);
+    if (cached && Date.now() - cached.at < 5 * 60_000) return cached;
+    const res = await this.#announceRaw(row);   // idempotent; returns fresh URLs
+    const entry = { ...res, at: Date.now() };
+    this.#targets.set(row.id, entry);
+    return entry;
+  }
+
+  // --- QUEUED → PREVIEW_CONFIRMED ------------------------------------------
+
+  async #startPreview(row) {
+    if (!row.preview_path) {
+      // RAW-only capture. There is no camera JPEG to send ahead, and the Bridge
+      // deliberately does not render one: customer-facing pixels are produced
+      // by the sandboxed server-side worker, not by a laptop at a venue.
+      this.spool.transition(row.id, S.UPLOADING_PREVIEW, { preview_skipped: 1 });
+      this.spool.transition(row.id, S.PREVIEW_CONFIRMED, {});
+      return;
+    }
+    this.spool.transition(row.id, S.UPLOADING_PREVIEW, {});
+  }
+
+  async #finishPreview(row) {
+    const targets = await this.#freshTargets(row);
+    const body = await readFile(row.preview_path);
+
+    // Re-verify before sending. Between hashing and uploading the file may have
+    // been replaced; uploading bytes whose digest we never computed would give
+    // the server something to confirm that we cannot vouch for.
+    const digest = sha256Buffer(body);
+    if (digest !== row.preview_sha256) {
+      // The server has already been told this capture's digest. We cannot
+      // quietly substitute different bytes, and re-announcing under the same
+      // idempotency key would be refused. Retire this capture and free the
+      // group key so the image now on disk is rediscovered on its own terms.
+      this.spool.rejectAndRelease(row.id, 'content_changed_after_announce',
+        { last_error: 'preview bytes changed between hashing and upload' });
+      this.log('content-changed', { id: row.id, path: row.preview_path });
+      return;
+    }
+
+    await this.client.uploadAsset({ target: targets.preview_upload, body });
+
+    // The upload returning 200 proves nothing. This does.
+    const ack = await this.client.confirmAsset({
+      captureId: row.server_capture_id, kind: 'preview',
+      sha256: digest, byteSize: body.byteLength,
+    });
+    if (ack?.status !== 'confirmed' || !ack.asset_id) {
+      throw new TransientError('preview not confirmed by server');
+    }
+    if (ack.sha256 && ack.sha256 !== digest) {
+      throw new TransientError('server stored a different preview digest');
+    }
+
+    this.spool.transition(row.id, S.PREVIEW_CONFIRMED, { preview_asset_id: ack.asset_id });
+  }
+
+  // --- PREVIEW_CONFIRMED → MASTER_CONFIRMED --------------------------------
+
+  async #startMaster(row) {
+    this.spool.transition(row.id, S.UPLOADING_MASTER, {});
+  }
+
+  async #finishMaster(row) {
+    const targets = await this.#freshTargets(row);
+    const body = await readFile(row.master_path);
+
+    const digest = sha256Buffer(body);
+    if (digest !== row.content_sha256) {
+      this.spool.rejectAndRelease(row.id, 'content_changed_after_announce',
+        { last_error: 'master bytes changed between hashing and upload' });
+      this.log('content-changed', { id: row.id, path: row.master_path });
+      return;
+    }
+
+    await this.client.uploadAsset({ target: targets.master_upload, body });
+
+    const ack = await this.client.confirmAsset({
+      captureId: row.server_capture_id, kind: 'master',
+      sha256: digest, byteSize: body.byteLength,
+    });
+    if (ack?.status !== 'confirmed' || !ack.asset_id) {
+      throw new TransientError('master not confirmed by server');
+    }
+    if (ack.sha256 && ack.sha256 !== digest) {
+      throw new TransientError('server stored a different master digest');
+    }
+
+    this.spool.transition(row.id, S.MASTER_CONFIRMED, { master_asset_id: ack.asset_id });
+  }
+
+  // --- MASTER_CONFIRMED → COMPLETE -----------------------------------------
+
+  async #complete(row) {
+    this.spool.transition(row.id, S.COMPLETE, {
+      completed_at: new Date().toISOString(),
+      cleanup_eligible_at: null,   // set by the retention policy, never here
+    });
+    this.#targets.delete(row.id);
+  }
+
+  /**
+   * Local cleanup. Note what it is not: a step in the pipeline. Reaching
+   * COMPLETE makes a file *eligible* for deletion and nothing more.
+   *
+   * Deletion requires, all at once: the server confirmed the master, the
+   * retention window has elapsed, and the bytes on disk still hash to what the
+   * server acknowledged. The default retention is null — never delete — because
+   * the correct default for somebody's only copy of a wedding is to keep it.
+   */
+  async sweepCleanup({ retentionMs = null, now = Date.now() } = {}) {
+    if (retentionMs == null) return { deleted: 0, skipped: 0, reason: 'retention disabled' };
+
+    const rows = this.spool.db.prepare(`
+      select * from captures
+       where state = ? and master_asset_id is not null and local_deleted_at is null
+    `).all(S.COMPLETE);
+
+    let deleted = 0, skipped = 0;
+    for (const row of rows) {
+      const completedAt = Date.parse(row.completed_at ?? '');
+      if (!completedAt || now - completedAt < retentionMs) { skipped++; continue; }
+
+      let st;
+      try { st = await stat(row.master_path); } catch { skipped++; continue; }
+      if (st.size !== row.byte_size) { skipped++; continue; }
+
+      const check = await hashStable(row.master_path);
+      if (check.changed || check.sha256 !== row.content_sha256) {
+        // Something else is on disk under that name now. Deleting it would
+        // destroy a file the server has never seen.
+        this.log('cleanup-skip', { id: row.id, reason: 'content no longer matches' });
+        skipped++; continue;
+      }
+
+      await unlink(row.master_path);
+      this.spool.db.prepare('update captures set local_deleted_at = ? where id = ?')
+        .run(new Date(now).toISOString(), row.id);
+      deleted++;
+    }
+    return { deleted, skipped };
+  }
+}

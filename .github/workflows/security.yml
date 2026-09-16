@@ -6,6 +6,7 @@ on:
   push:
     branches: ['**']
   pull_request:
+  workflow_dispatch:
 
 jobs:
   authorization:
@@ -26,3 +27,35 @@ jobs:
           # Redundant with the in-suite structural gate, but this one names the
           # table in the job summary rather than inside a psql NOTICE.
           echo "covered by tests/security/authorization_tests.sql structural gates"
+
+  bridge:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-node@v4
+        with:
+          node-version: '22'
+
+      # No install step: the Bridge has zero runtime and zero dev dependencies.
+      # Dependency compromise is in our own threat model, and a crash-safety
+      # critical agent on a photographer's laptop is the wrong place for a
+      # supply chain.
+      - name: Bridge tests (state machine, scenarios, crash safety)
+        working-directory: bridge
+        run: npm test
+
+  bridge-soak:
+    # The Phase 2 milestone: 500+ photographs through an unstable event.
+    # Slow, so it runs on the default branch and on demand rather than on
+    # every push to a feature branch.
+    if: github.ref == 'refs/heads/main' || github.event_name == 'workflow_dispatch'
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-node@v4
+        with:
+          node-version: '22'
+      - name: 500 photographs, unstable connectivity, repeated kill -9
+        working-directory: bridge
+        run: npm run test:soak

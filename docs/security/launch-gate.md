@@ -46,8 +46,8 @@ what feels like security work.
 
 | # | Gate | Passes when | Status |
 |---|---|---|---|
-| 5 | Bridge holds no platform credential | A full filesystem dump of a Bridge install yields a device key and nothing else | not built |
-| 9 | Device revocation is immediate | Revoking a device kills new sessions within seconds, not at token expiry | schema ready, flow not built |
+| 5 | Bridge holds no platform credential | A full filesystem dump of a Bridge install yields a device key and nothing else | **built** — `bridge/`, Ed25519 identity encrypted at rest, no service key anywhere |
+| 9 | Device revocation is immediate | Revoking a device kills new sessions within seconds, not at token expiry | **built** — `app.device_session_is_live` plus Bridge-side halt; covered by two Bridge tests |
 | 8 | Cost abuse hits a limit | Automated create/upload/checkout/edit loops trip quotas instead of compute | columns exist, enforcement missing; `platform_settings.processing_halted` is the kill switch |
 | — | Entitlement anchored to a verified contact | A customer with no cookie recovers their photos by proving contact, not by holding a URL | not built |
 | — | MFA on owners and admins | Password alone does not reach payouts, device enrollment or credential creation | not built |
@@ -73,6 +73,31 @@ suite that only proves the happy path works proves nothing about security.
 
 The suite runs inside a transaction and rolls back, so it is safe against a
 scratch or branch database. **Never point it at production.**
+
+## Phase 2 exit criteria
+
+The Bridge milestone, as executable claims rather than intentions
+(`bridge/test/`, 31 tests plus the soak):
+
+| Criterion | Test |
+|---|---|
+| A capture is durable before any processing | `a discovered row is committed before anything else happens` |
+| Bad or absent wifi loses nothing | `wifi disappearing mid-event loses nothing and resumes on reconnect` |
+| Reconnection resumes automatically | same, plus `recovery rewinds interrupted uploads and nothing else` |
+| Duplicate filesystem events do not duplicate captures | `repeated scans of an unchanged card create nothing new` |
+| Duplicate camera filenames stay separate photographs | `duplicate camera filenames on different cards stay separate photographs` |
+| Success is never inferred from a local HTTP result | `a corrupted upload is never confirmed, and is re-sent until it matches` |
+| Local cleanup waits for server confirmation | `local files are never deleted before the server confirms the master` |
+| Power loss after detection | `the spool survives a kill with no torn or unreadable rows` |
+| Restart during upload | `every photograph survives repeated kill -9` |
+| Commit-then-lost-acknowledgement | `a kill between server commit and our acknowledgement still yields one capture` |
+| Partial / corrupt / replaced files | four scenario tests |
+| Revoked, compromised, wrong event, expired session | four scenario tests |
+| 500+ photographs through an unstable event | `npm run test:soak` |
+
+Not yet done in Phase 2, and named rather than left implicit: resumable
+multipart upload for very large masters, RAW embedded-preview extraction, and
+OS keychain storage for the device key.
 
 ## Keeping the suite honest
 
