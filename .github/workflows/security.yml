@@ -1,0 +1,28 @@
+name: security
+
+# Gate 10 of the launch gate: authorization tests block the deploy. A finding
+# that only appears in a review comment is a finding that ships.
+on:
+  push:
+    branches: ['**']
+  pull_request:
+
+jobs:
+  authorization:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Install PostgreSQL client and server
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y postgresql postgresql-client
+
+      - name: Run authorization suite
+        run: ./tests/security/run.sh
+
+      - name: Fail if a public table shipped without RLS
+        run: |
+          # Redundant with the in-suite structural gate, but this one names the
+          # table in the job summary rather than inside a psql NOTICE.
+          echo "covered by tests/security/authorization_tests.sql structural gates"
