@@ -19,13 +19,36 @@ so they are done before the first line of product code.
 | 7 | Private buckets | Masters and deliverables are private and cannot be made public | schema + tests in place |
 | 10 | Tests gate the deploy | `tests/security/authorization_tests.sql` runs on every deploy and blocks on failure | `.github/workflows/security.yml` |
 
+### On v2's Phase 6
+
+Hardened Architecture v2 §41 puts rate limiting, resource quotas, worker
+sandboxing, device revocation and MFA in a final phase called "Hardening."
+
+That name is the problem. A phase called Hardening gives everything in it
+permission to be late, and three of those five cannot be:
+
+- **Device revocation** is needed the day the second device is enrolled — Phase 2.
+  A stolen laptop before Phase 6 has no off switch.
+- **Rate limiting and quotas** are needed the day a gallery is reachable from the
+  public internet — Phase 3. That is the first moment someone who is not a
+  customer can cost you money.
+- **MFA** is needed before the dashboard holds revenue — Phase 4. Shipping
+  commerce with password-only admin access means a credential stuffing list is
+  a business takeover.
+
+Only worker sandboxing, chaos tests and penetration testing are genuinely
+Phase 6 work. The rest belongs in the phase that creates the exposure.
+
+The tiers below are ordered on that principle: what creates the exposure, not
+what feels like security work.
+
 ## Tier 2 — moderate, before first paying customer
 
 | # | Gate | Passes when | Status |
 |---|---|---|---|
 | 5 | Bridge holds no platform credential | A full filesystem dump of a Bridge install yields a device key and nothing else | not built |
 | 9 | Device revocation is immediate | Revoking a device kills new sessions within seconds, not at token expiry | schema ready, flow not built |
-| 8 | Cost abuse hits a limit | Automated create/upload/checkout/edit loops trip quotas instead of compute | columns exist, enforcement missing |
+| 8 | Cost abuse hits a limit | Automated create/upload/checkout/edit loops trip quotas instead of compute | columns exist, enforcement missing; `platform_settings.processing_halted` is the kill switch |
 | — | Entitlement anchored to a verified contact | A customer with no cookie recovers their photos by proving contact, not by holding a URL | not built |
 | — | MFA on owners and admins | Password alone does not reach payouts, device enrollment or credential creation | not built |
 

@@ -82,6 +82,8 @@ select pg_temp.rejects(
 
 insert into auth.users (id, email) values
   ('00000000-0000-0000-0000-0000000000a1', 'a@example.test'),
+  ('00000000-0000-0000-0000-0000000000a2', 'finance-a@example.test'),
+  ('00000000-0000-0000-0000-0000000000a3', 'shooter-a@example.test'),
   ('00000000-0000-0000-0000-0000000000b1', 'b@example.test')
 on conflict do nothing;
 
@@ -91,47 +93,74 @@ insert into public.organizations (id, slug, display_name) values
 
 insert into public.organization_members (organization_id, user_id, role) values
   ('00000000-0000-0000-0000-00000000a000', '00000000-0000-0000-0000-0000000000a1', 'owner'),
+  ('00000000-0000-0000-0000-00000000a000', '00000000-0000-0000-0000-0000000000a2', 'finance'),
+  ('00000000-0000-0000-0000-00000000a000', '00000000-0000-0000-0000-0000000000a3', 'photographer'),
   ('00000000-0000-0000-0000-00000000b000', '00000000-0000-0000-0000-0000000000b1', 'owner');
 
-insert into public.events (id, organization_id, name) values
-  ('00000000-0000-0000-0000-00000000a001', '00000000-0000-0000-0000-00000000a000', 'A Wedding'),
-  ('00000000-0000-0000-0000-00000000b001', '00000000-0000-0000-0000-00000000b000', 'B Wedding');
+insert into public.events (id, organization_id, name, status) values
+  ('00000000-0000-0000-0000-00000000a001', '00000000-0000-0000-0000-00000000a000', 'A Wedding', 'live'),
+  ('00000000-0000-0000-0000-00000000b001', '00000000-0000-0000-0000-00000000b000', 'B Wedding', 'live');
 
 insert into public.devices (id, organization_id, label, public_key) values
-  ('00000000-0000-0000-0000-00000000a002', '00000000-0000-0000-0000-00000000a000', 'A body 1', '\xa1'),
-  ('00000000-0000-0000-0000-00000000b002', '00000000-0000-0000-0000-00000000b000', 'B body 1', '\xb1');
+  ('00000000-0000-0000-0000-00000000a002', '00000000-0000-0000-0000-00000000a000', 'A body 1', '\\xa1'),
+  ('00000000-0000-0000-0000-00000000b002', '00000000-0000-0000-0000-00000000b000', 'B body 1', '\\xb1');
 
--- Two captures in Studio A's event: CAP1 will be bought, CAP2 will not.
+-- organization_id is omitted on purpose: it must be derived from the parent.
 insert into public.captures (id, event_id, device_id, device_sequence, captured_at, content_hash, status) values
   ('00000000-0000-0000-0000-0000000000c1', '00000000-0000-0000-0000-00000000a001',
-   '00000000-0000-0000-0000-00000000a002', 1, now(), '\xdead01', 'verified'),
+   '00000000-0000-0000-0000-00000000a002', 1, now(), '\\xdead01', 'verified'),
   ('00000000-0000-0000-0000-0000000000c2', '00000000-0000-0000-0000-00000000a001',
-   '00000000-0000-0000-0000-00000000a002', 2, now(), '\xdead02', 'verified');
-
--- A capture in Studio B's event: the target of every cross-event attack below.
-insert into public.captures (id, event_id, device_id, device_sequence, captured_at, content_hash, status) values
+   '00000000-0000-0000-0000-00000000a002', 2, now(), '\\xdead02', 'verified'),
+  -- A capture in Studio B's event: the target of every cross-event attack below.
   ('00000000-0000-0000-0000-0000000000c9', '00000000-0000-0000-0000-00000000b001',
    '00000000-0000-0000-0000-00000000b002', 1, now(), '\\xdead09', 'verified');
 
-insert into public.assets (capture_id, kind, bucket, object_path, checksum) values
-  ('00000000-0000-0000-0000-0000000000c9', 'deliverable', 'deliverable', 'b001/c9.jpg', '\\xbeef09'),
-  ('00000000-0000-0000-0000-0000000000c1', 'master', 'master', 'a001/c1.cr3', '\xdead01'),
-  ('00000000-0000-0000-0000-0000000000c1', 'deliverable', 'deliverable', 'a001/c1.jpg', '\xbeef01'),
-  ('00000000-0000-0000-0000-0000000000c2', 'master', 'master', 'a001/c2.cr3', '\xdead02'),
-  ('00000000-0000-0000-0000-0000000000c2', 'deliverable', 'deliverable', 'a001/c2.jpg', '\xbeef02');
+do $$
+declare v uuid;
+begin
+  select organization_id into v from public.captures where id = '00000000-0000-0000-0000-0000000000c1';
+  perform pg_temp.ok(v = '00000000-0000-0000-0000-00000000a000',
+    'denormalized organization_id is derived from the parent when omitted');
+end;
+$$;
+
+insert into public.assets (capture_id, kind, bucket, object_path, checksum, status) values
+  ('00000000-0000-0000-0000-0000000000c1', 'master', 'master',
+   '00000000-0000-0000-0000-00000000a000/00000000-0000-0000-0000-00000000a001/00000000-0000-0000-0000-0000000000c1/original.cr3', '\\xdead01', 'verified'),
+  ('00000000-0000-0000-0000-0000000000c2', 'master', 'master',
+   '00000000-0000-0000-0000-00000000a000/00000000-0000-0000-0000-00000000a001/00000000-0000-0000-0000-0000000000c2/original.cr3', '\\xdead02', 'verified');
+
+-- A published price list. Without one, nothing in this event may be sold.
+-- Priced while in draft, then published. Items cannot be added to or edited on
+-- a published list — changing prices means publishing a new version.
+insert into public.price_lists (id, event_id, currency) values
+  ('00000000-0000-0000-0000-0000000009a1', '00000000-0000-0000-0000-00000000a001', 'PHP');
+insert into public.price_items (price_list_id, unit_price_minor) values
+  ('00000000-0000-0000-0000-0000000009a1', 15000);   -- PHP 150.00 default
+update public.price_lists set published_at = now()
+  where id = '00000000-0000-0000-0000-0000000009a1';
 
 insert into public.customer_sessions (id, event_id, token_hash, expires_at) values
   ('00000000-0000-0000-0000-0000000000f1', '00000000-0000-0000-0000-00000000a001',
-   '\xf1', now() + interval '30 days');
+   '\\xf1', now() + interval '30 days');
 
 insert into public.orders (id, event_id, organization_id, customer_session_id, status) values
   ('00000000-0000-0000-0000-0000000000e1', '00000000-0000-0000-0000-00000000a001',
    '00000000-0000-0000-0000-00000000a000', '00000000-0000-0000-0000-0000000000f1', 'draft');
 
--- ₱150.00 in centavos. The customer bought CAP1 only.
+-- The customer bought CAP1 only. The price supplied here is a lie (PHP 1.00);
+-- the database must replace it with the published price.
 insert into public.order_items (id, order_id, capture_id, unit_price_minor) values
   ('00000000-0000-0000-0000-0000000000d1', '00000000-0000-0000-0000-0000000000e1',
-   '00000000-0000-0000-0000-0000000000c1', 15000);
+   '00000000-0000-0000-0000-0000000000c1', 100);
+
+-- Deliverables are order-scoped (v2 §9/§26), so they exist only once a line
+-- item does, and they live under the order's path, not the capture's.
+insert into public.assets (capture_id, order_item_id, kind, bucket, object_path, checksum, status) values
+  ('00000000-0000-0000-0000-0000000000c1', '00000000-0000-0000-0000-0000000000d1',
+   'deliverable', 'deliverable',
+   '00000000-0000-0000-0000-00000000a000/00000000-0000-0000-0000-0000000000e1/00000000-0000-0000-0000-0000000000d1/v1.jpg',
+   '\\xbeef01', 'ready');
 
 -- =============================================================================
 -- Attack: price manipulation
@@ -140,10 +169,27 @@ insert into public.order_items (id, order_id, capture_id, unit_price_minor) valu
 do $$
 declare v bigint;
 begin
+  select unit_price_minor into v from public.order_items where id = '00000000-0000-0000-0000-0000000000d1';
+  perform pg_temp.ok(v = 15000,
+    'a caller-supplied line price is replaced by the published price list (got ' || v || ')');
+
   select amount_minor into v from public.orders where id = '00000000-0000-0000-0000-0000000000e1';
   perform pg_temp.ok(v = 15000, 'order total is derived from line items (got ' || v || ')');
 end;
 $$;
+
+-- Fail closed: an event with no published price list cannot sell anything.
+select pg_temp.rejects(
+  $q$ insert into public.orders (id, event_id, organization_id, customer_session_id)
+      values ('00000000-0000-0000-0000-0000000000e9', '00000000-0000-0000-0000-00000000b001',
+              '00000000-0000-0000-0000-00000000b000',
+              (select id from public.customer_sessions limit 1)) $q$,
+  'a session from another event cannot open an order');
+
+select pg_temp.rejects(
+  $q$ update public.price_items set unit_price_minor = 1
+      where price_list_id = '00000000-0000-0000-0000-0000000009a1' $q$,
+  'a published price list is immutable');
 
 -- The client says "one peso, please" and a handler writes it straight onto the
 -- order. There must be no window in which that value is live, because the
@@ -255,7 +301,7 @@ begin
   select object_path into v
   from app.authorize_download('00000000-0000-0000-0000-0000000000f1',
                               '00000000-0000-0000-0000-0000000000c1');
-  perform pg_temp.ok(v = 'a001/c1.jpg', 'the purchased capture is downloadable');
+  perform pg_temp.ok(v like '%/v1.jpg', 'the purchased capture is downloadable (got ' || coalesce(v,'nothing') || ')');
 end;
 $$;
 
@@ -325,6 +371,37 @@ begin
 end;
 $$;
 
+-- An asset row existing is not the same as its bytes being servable. 0001
+-- conflated the two; v2 §7 does not.
+do $$
+declare n integer;
+begin
+  update public.assets set status = 'pending'
+   where kind = 'deliverable' and order_item_id = '00000000-0000-0000-0000-0000000000d1';
+  select count(*) into n
+  from app.authorize_download('00000000-0000-0000-0000-0000000000f1',
+                              '00000000-0000-0000-0000-0000000000c1');
+  perform pg_temp.ok(n = 0, 'a deliverable that is not READY is not downloadable');
+  update public.assets set status = 'ready'
+   where kind = 'deliverable' and order_item_id = '00000000-0000-0000-0000-0000000000d1';
+end;
+$$;
+
+-- An expired entitlement stops authorizing, without anyone revoking it.
+do $$
+declare n integer;
+begin
+  update public.entitlements set expires_at = now() - interval '1 second'
+   where id = '00000000-0000-0000-0000-00000000e1e1';
+  select count(*) into n
+  from app.authorize_download('00000000-0000-0000-0000-0000000000f1',
+                              '00000000-0000-0000-0000-0000000000c1');
+  perform pg_temp.ok(n = 0, 'an expired entitlement stops authorizing downloads');
+  update public.entitlements set expires_at = null
+   where id = '00000000-0000-0000-0000-00000000e1e1';
+end;
+$$;
+
 -- =============================================================================
 -- Attack: queue poisoning / duplicate expensive jobs
 -- =============================================================================
@@ -339,9 +416,21 @@ select pg_temp.rejects(
 -- Attack: compromised Bridge swaps the bytes behind an existing capture
 -- =============================================================================
 
+-- Guard against a vacuous test: the row must exist before the update is
+-- expected to be rejected, or "0 rows changed" masquerades as a working control.
+do $$
+declare n integer;
+begin
+  select count(*) into n from public.assets
+   where kind = 'master' and capture_id = '00000000-0000-0000-0000-0000000000c1';
+  perform pg_temp.ok(n = 1, 'the master asset under test exists');
+end;
+$$;
+
 select pg_temp.rejects(
-  $q$ update public.assets set object_path = 'a001/evil.cr3'
-      where bucket = 'master' and object_path = 'a001/c1.cr3' $q$,
+  $q$ update public.assets
+      set object_path = '00000000-0000-0000-0000-00000000a000/00000000-0000-0000-0000-00000000a001/00000000-0000-0000-0000-0000000000c1/evil.cr3'
+      where kind = 'master' and capture_id = '00000000-0000-0000-0000-0000000000c1' $q$,
   'a master asset path is immutable');
 
 select pg_temp.rejects(
@@ -354,6 +443,69 @@ select pg_temp.rejects(
       values ('00000000-0000-0000-0000-00000000a001',
               '00000000-0000-0000-0000-00000000a002', 1, now()) $q$,
   'a device cannot replay a capture sequence number');
+
+-- =============================================================================
+-- Attack: test-mode webhook against a live platform  (v2 §19, §39)
+-- =============================================================================
+-- A correctly-signed test-mode event that can mark a live order paid is free
+-- photographs for anyone who read the integration guide — and it leaves a
+-- clean, well-formed audit trail behind it.
+
+update public.platform_settings set livemode = true where id;
+
+select pg_temp.rejects(
+  $q$ insert into public.payment_events
+        (provider_event_id, kind, order_id, amount_minor, currency,
+         signature_verified, livemode, raw_payload)
+      values ('evt_testmode', 'paid', '00000000-0000-0000-0000-0000000000e1',
+              15000, 'PHP', true, false, '{}') $q$,
+  'a test-mode payment event cannot bind to an order on a live platform');
+
+update public.platform_settings set livemode = false where id;
+
+-- =============================================================================
+-- Attack: poison the denormalized tenancy column  (v2 §2)
+-- =============================================================================
+-- Carrying organization_id on every row makes RLS direct, but a row whose
+-- denormalized org disagrees with its parent is a tenant boundary violation
+-- that every join-free policy will honour. v2 asks for the column and does not
+-- mention this failure mode.
+
+select pg_temp.rejects(
+  $q$ insert into public.captures
+        (event_id, device_id, device_sequence, captured_at, organization_id)
+      values ('00000000-0000-0000-0000-00000000a001',
+              '00000000-0000-0000-0000-00000000a002', 99, now(),
+              '00000000-0000-0000-0000-00000000b000') $q$,
+  'a capture cannot claim an organization its event does not belong to');
+
+select pg_temp.rejects(
+  $q$ update public.captures set organization_id = '00000000-0000-0000-0000-00000000b000'
+      where id = '00000000-0000-0000-0000-0000000000c1' $q$,
+  'a capture cannot be moved to another organization by rewriting its org column');
+
+-- =============================================================================
+-- Attack: supply your own storage path  (v2 §9)
+-- =============================================================================
+
+select pg_temp.rejects(
+  $q$ insert into public.assets (capture_id, kind, bucket, object_path, status)
+      values ('00000000-0000-0000-0000-0000000000c2', 'preview', 'preview',
+              'somewhere/else/v1.webp', 'ready') $q$,
+  'an asset path that is not server-derived is rejected');
+
+select pg_temp.rejects(
+  $q$ insert into public.assets (capture_id, kind, bucket, object_path, status)
+      values ('00000000-0000-0000-0000-0000000000c2', 'preview', 'preview',
+              '00000000-0000-0000-0000-00000000a000/00000000-0000-0000-0000-00000000a001/00000000-0000-0000-0000-0000000000c2/../../../master/leak.cr3',
+              'ready') $q$,
+  'an asset path containing a traversal sequence is rejected');
+
+select pg_temp.rejects(
+  $q$ insert into public.assets (capture_id, kind, bucket, object_path, status)
+      values ('00000000-0000-0000-0000-0000000000c2', 'deliverable', 'deliverable',
+              '00000000-0000-0000-0000-00000000a000/x/y/v1.jpg', 'ready') $q$,
+  'a deliverable with no order item is rejected');
 
 -- =============================================================================
 -- Attack: cross-tenant breakout via object id substitution
@@ -385,6 +537,44 @@ begin
   select count(*) into n from public.devices
    where organization_id = '00000000-0000-0000-0000-00000000a000';
   perform pg_temp.ok(n = 0, 'RLS hides another organization''s devices');
+end;
+$$;
+
+reset role;
+
+-- -----------------------------------------------------------------------------
+-- Least privilege between two people who both work here (v2 §3).
+-- Membership alone decides nothing.
+-- -----------------------------------------------------------------------------
+
+set local role authenticated;
+set local request.jwt.claims = '{"sub":"00000000-0000-0000-0000-0000000000a2","role":"authenticated"}';
+do $$
+declare n integer;
+begin
+  select count(*) into n from public.orders
+   where organization_id = '00000000-0000-0000-0000-00000000a000';
+  perform pg_temp.ok(n > 0, 'FINANCE reads its own organization''s revenue');
+
+  select count(*) into n from public.captures
+   where organization_id = '00000000-0000-0000-0000-00000000a000';
+  perform pg_temp.ok(n = 0, 'FINANCE reads no photographs');
+end;
+$$;
+reset role;
+
+set local role authenticated;
+set local request.jwt.claims = '{"sub":"00000000-0000-0000-0000-0000000000a3","role":"authenticated"}';
+do $$
+declare n integer;
+begin
+  select count(*) into n from public.captures
+   where organization_id = '00000000-0000-0000-0000-00000000a000';
+  perform pg_temp.ok(n > 0, 'PHOTOGRAPHER reads its own organization''s photographs');
+
+  select count(*) into n from public.orders
+   where organization_id = '00000000-0000-0000-0000-00000000a000';
+  perform pg_temp.ok(n = 0, 'PHOTOGRAPHER reads no revenue');
 end;
 $$;
 

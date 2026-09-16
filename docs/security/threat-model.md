@@ -44,7 +44,20 @@ infrastructure work still sits on top.
 | 15 | Order booked to the wrong tenant | `guard_order_tenancy` ties `orders.organization_id` to the event's owner and the session's event | `an order cannot be booked to an organization that does not own the event` | closed |
 | 16 | Cross-event line item — buy another photographer's photo through your own checkout | `guard_order_item_integrity` requires the capture's event to be the order's event; `app.authorize_download()` re-checks it | `a line item cannot reference a capture from another event` | closed |
 | 17 | Direct write of a tampered order total | `guard_order_amount` re-derives `amount_minor` on every write to `orders`, not only when a line item is touched | `a total written directly onto the order is overwritten immediately` | closed |
+| 18 | Test-mode webhook against a live platform | `payment_events.livemode` must equal `app.platform_livemode()` before the event may bind to an order, and again at the `paid` transition | `a test-mode payment event cannot bind to an order on a live platform` | closed |
+| 19 | Poisoned denormalized tenancy | `guard_denormalized_org` derives `organization_id` from the parent when omitted and rejects it when supplied and wrong | `a capture cannot claim an organization its event does not belong to` | closed |
+| 20 | Client-supplied storage path / traversal | `guard_asset_path` requires the server-derived prefix and rejects `..` | `an asset path that is not server-derived is rejected` | closed |
+| 21 | Price written by a buggy or compromised server | `guard_order_item_price` resolves the price from the event's published price list and discards whatever the caller supplied | `a caller-supplied line price is replaced by the published price list` | closed |
+| 22 | Selling from an unpriced event | `app.resolve_price` fails closed — no published list means nothing may be sold | `a published price list is immutable` | closed |
+| 23 | Serving an asset that is not ready | `authorize_download` requires `assets.status = 'ready'`; an asset row existing is not the bytes being servable | `a deliverable that is not READY is not downloadable` | closed |
+| 24 | Entitlement outliving its grant | `entitlements.expires_at` honoured in the chokepoint | `an expired entitlement stops authorizing downloads` | closed |
+| 25 | Bookkeeper reads photos / photographer reads revenue | Role-scoped RLS: FINANCE reaches orders, PHOTOGRAPHER reaches captures, neither reaches both | four role-split assertions | closed |
 | 14 | Chargeback / refund after delivery | Entitlement revocation is a first-class operation, separate from payment state | `a revoked entitlement stops authorizing downloads` | partial — see §3 |
+
+Rows 18–25 come from reconciling Hardened Architecture v2. Three of them —
+`livemode`, order-scoped deliverables, and asset status — are places where v2 is
+genuinely stronger than the first schema, and are credited as such in
+`supabase/migrations/0004_v2_reconciliation.sql`.
 
 Rows 15–17 were not found by reading the design. They were found by executing
 the attacks against the schema and watching them succeed, after an earlier
@@ -142,7 +155,29 @@ Controls: an explicit "done / not me" session termination on every order screen,
 a short idle timeout on booth devices, a kiosk mode that clears session state
 between customers, and never rendering full contact details in the gallery UI.
 
-### 31. Refund-timing race — Medium
+### 31. v2 §15 and v2 §29 contradict each other — High
+
+This is not a new attack; it is the session-portability hole from §29 above,
+surfacing as an internal inconsistency in the v2 document.
+
+§15 gives the customer a cookie-only anonymous session and no account. §29 then
+says: do not email the signed file URL — email a link to the order page, and
+"the order page re-authorizes the customer."
+
+Re-authorizes them with what? The cookie is on the phone they paid with. The
+email is open on a laptop. There are exactly two ways to resolve this, and v2
+picks neither:
+
+1. The emailed link carries a bearer token — which is the recovery-link
+   credential §29 was written to avoid, now load-bearing for every customer.
+2. The order page proves a verified contact — which means the contact must have
+   been verified at checkout, which §15 does not do.
+
+Option 2 is the right one, and it is a change to §15, not to §29.
+`customer_sessions.verified_email`, `verified_phone` and `contact_verified_at`
+exist for it. Until then, §29's advice is sound and unimplementable.
+
+### 32. Refund-timing race — Medium
 
 Refund issued while the HD worker is mid-job: the entitlement revokes, the worker
 finishes, the deliverable lands, and a stale signed URL or a retried request

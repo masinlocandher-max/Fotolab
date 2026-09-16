@@ -19,6 +19,7 @@ The foundation the rest of the platform is built on. Read in this order:
 | `supabase/migrations/0001_security_foundation.sql` | Schema, state machines, integrity triggers, `app.authorize_download()` |
 | `supabase/migrations/0002_row_level_security.sql` | RLS policies and grant revocations |
 | `supabase/migrations/0003_storage_buckets.sql` | Private buckets and the never-public guard |
+| `supabase/migrations/0004_v2_reconciliation.sql` | Hardened Architecture v2 deltas: price lists, livemode, denormalized tenancy, asset status, order-scoped deliverables, role split |
 | `tests/security/authorization_tests.sql` | The suite that gates deploys |
 
 ## The one idea
