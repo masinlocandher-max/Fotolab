@@ -272,15 +272,42 @@ Stated rather than discovered later.
 
 ---
 
+## Field harness: observed results
+
+Eleven short runs (45 shutter presses, scaled file sizes) were executed after
+the vanished-source fix. Ten delivered **every file on the card byte-exact**.
+One delivered 74 of 76, alongside a `content_changed_after_announce` rejection.
+
+Of the five runs after the final harness correction: four passed outright, one
+was the 74-of-76 run. **That residual was not isolated.** The suspected
+mechanism is a slow write completing while its capture is between announce and
+upload, near the end of the run, leaving too little time for the retired
+capture's replacement to be rediscovered and uploaded — but that is a
+hypothesis, not a finding, and it is recorded as an open item rather than
+explained away.
+
+Two earlier runs failed the coverage audit rather than the delivery check, and
+each produced a harness correction (idle-batch deferral, rotation
+displacement). Those are described above.
+
+**The full 1200-press gate at realistic file sizes has not been executed.** A
+45-press scaled run takes roughly sixteen minutes here; the gate is hours. It
+is wired as `npm run qualify` and in CI on the default branch, and it has not
+been run to completion in this environment.
+
 ## Qualification status
 
 The honest label as of this document:
 
-- **Engineering-qualified** — yes. The suites pass, every new safety invariant
-  has been mutation-tested, and the defects above were found by execution
-  rather than review.
-- **Field-qualified** — not yet. Everything here ran on Linux, in a container,
-  against a simulated server and a simulated camera.
-- **Shadow-event-qualified** — no. No real event has been shot.
+- **Engineering-qualified** — yes. The database and Bridge suites pass
+  repeatedly and stably, every new safety invariant has been mutation-tested,
+  and all eleven defects above were found by execution rather than review.
+- **Field-qualified** — **no.** Two things block it, and neither is a
+  formality: the field gate is not consistently green (one run in five lost
+  two files, unexplained), and the full-scale gate has never been executed.
+- **Shadow-event-qualified** — no. No real event has been shot, and nothing
+  here has ever run on macOS or Windows, where filesystem case sensitivity —
+  which capture identity depends on directly — differs.
 
-The next step is not more simulation.
+The next step is to isolate the remaining delivery failure and run the gate at
+full scale. Only then does a shadow event become worth a photographer's day.
