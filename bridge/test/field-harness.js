@@ -339,7 +339,19 @@ export class FieldHarness {
       // fault types uninjected on a short run, and a fault that never fired
       // proves nothing — so each batch deterministically takes the next fault
       // in rotation on top of whatever the dice produce.
-      const scheduled = FAULTS[batch % FAULTS.length];
+      //
+      // A fault deferred from an earlier batch (because the system was idle
+      // and injecting it would have tested nothing) takes priority.
+      this.deferred ??= [];
+      const rotation = FAULTS[batch % FAULTS.length];
+      let scheduled = rotation;
+      if (this.deferred.length) {
+        // A deferred fault takes this batch's slot — but the fault it displaces
+        // must go back in the queue, or it silently loses its only turn and
+        // the rotation stops being complete coverage.
+        scheduled = this.deferred.shift();
+        if (scheduled !== rotation) this.deferred.push(rotation);
+      }
 
       // The camera shoots this batch, sometimes in a burst.
       const burst = rnd(100) < 25;
@@ -362,12 +374,14 @@ export class FieldHarness {
       const env = {};
       let killOnProgress = false;
 
-      // The scheduled fault takes precedence: an `else if` chain where a
-      // random roll can pre-empt the scheduled one makes rotation coverage a
-      // claim rather than a fact.
+      // The scheduled fault takes precedence, and a batch testing something
+      // specific does not also get a random process death on top: killing the
+      // worker early is exactly what stops the scheduled fault from reaching
+      // live work.
+      const killFaults = new Set(['process_death', 'machine_restart']);
       const on = (fault, chance) =>
-        scheduled === fault || (scheduled !== 'process_death' && scheduled !== 'machine_restart'
-                                && rnd(100) < chance);
+        scheduled === fault || (!killFaults.has(fault) && rnd(100) < chance)
+        || (killFaults.has(fault) && !scheduled && rnd(100) < chance);
 
       if (on('process_death', 30)) {
         this.record('process_death');
@@ -385,8 +399,14 @@ export class FieldHarness {
       if (on('request_timeout', 15)) { this.record('request_timeout'); this.server.faults.confirm5xx = 1 + rnd(2); }
       if (on('low_disk', 12)) { this.record('low_disk'); env.BRIDGE_DISK_CRITICAL = '1'; }
 
+      // Pulling the card before the worker starts, with nothing already
+      // spooled, removes the only source of work — so the fault lands on an
+      // empty system and tests nothing. Defer it until there is a backlog.
       let removed = null;
-      if (on('card_removed', 12)) removed = this.#removeCard();
+      if (on('card_removed', 12)) {
+        if (this.inFlight() > 0) removed = this.#removeCard();
+        else this.deferred.push('card_removed');
+      }
 
       const { peak } = await this.#sampleWhile(
         this.runWorker({ killOnProgress, env, timeoutMs: last ? 180_000 : 60_000 }));
@@ -401,6 +421,30 @@ export class FieldHarness {
         this.record('duplicate_fs_event', { note: 'rescan of unchanged card' });
         this.ledger[this.ledger.length - 1].inFlight = peak;
       }
+    }
+
+    // Anything still deferred never got its turn. Give it one now, with work
+    // guaranteed to be in flight, rather than reporting a coverage gap that is
+    // an artefact of scheduling.
+    let guard = 0;
+    while (this.deferred.length && guard++ < FAULTS.length) {
+      const fault = this.deferred.shift();
+      this.currentBatch = this.batches + 100 + guard;
+      for (let i = 0; i < 3; i++) this.press();
+      const env = {};
+      if (fault === 'corrupt_transfer') { this.record(fault); this.server.faults.corruptUpload = 2; }
+      else if (fault === 'card_removed') {
+        // Spool the work first, then pull the card, so it lands on live work.
+        await this.#sampleWhile(this.runWorker({ killOnProgress: true, timeoutMs: 30_000 }))
+          .then(({ peak }) => this.#scoreBatch(this.currentBatch, peak));
+        const stash = this.#removeCard();
+        const { peak } = await this.#sampleWhile(this.runWorker({ timeoutMs: 30_000 }));
+        this.#scoreBatch(this.currentBatch, peak);
+        if (stash) this.#returnCard(stash);
+        continue;
+      } else { this.record(fault); }
+      const { peak } = await this.#sampleWhile(this.runWorker({ env, timeoutMs: 60_000 }));
+      this.#scoreBatch(this.currentBatch, peak);
     }
 
     // Everything the card was still writing has now landed.
