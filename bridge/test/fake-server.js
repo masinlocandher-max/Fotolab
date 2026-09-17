@@ -15,6 +15,7 @@ export class FakeServer {
     // event id -> owning organization. Anything not listed belongs to the
     // default organization, which keeps the single-tenant tests unchanged.
     this.eventOwners = new Map(Object.entries(events ?? {}));
+    this.eventLabels = new Map();
 
     this.devices = new Map();          // device_id -> {publicKey, status, organizationId}
     this.challenges = new Map();
@@ -215,6 +216,7 @@ export class FakeServer {
     return this.#json(res, 200, {
       session_id: randomUUID(), token, event_id: body.event_id,
       organization_id: d.organizationId, expires_at: new Date(expiresAt).toISOString(),
+      event_label: this.eventLabels?.get(body.event_id) ?? body.event_id,
       clone_suspected: !!d.cloneSuspected,
     });
   }

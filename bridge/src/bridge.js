@@ -9,6 +9,7 @@ import { Scanner } from './scanner.js';
 import { HttpClient, AuthorityError } from './client.js';
 import { Pipeline } from './pipeline.js';
 import { checkDisk, DISK, DEFAULT_THRESHOLDS, mayIngest } from './disk.js';
+import { recordHeartbeat, recordServerContact, buildStatus } from './status.js';
 import { dirname } from 'node:path';
 
 export class Bridge {
@@ -115,6 +116,10 @@ export class Bridge {
       sessionId: s.session_id, eventId: s.event_id,
       organizationId: s.organization_id, token: s.token, expiresAt: s.expires_at,
     });
+    // A name the photographer recognises, so "am I on the right event?" has an
+    // answer that is not a UUID.
+    this.eventLabel = s.event_label ?? this.eventLabel ?? null;
+    recordServerContact(this.db);
     if (s.clone_suspected) {
       this.haltReason = 'clone_suspected';
       this.log('clone-suspected', {
@@ -216,6 +221,7 @@ export class Bridge {
     let cycles = 0;
     while (!this.stopped && cycles < maxCycles) {
       cycles++;
+      recordHeartbeat(this.db);
       try {
         await this.runOnce();
       } catch (err) {
@@ -237,6 +243,9 @@ export class Bridge {
   isQuiescent() {
     return this.spool.pending().length === 0 && this.scanner.waitingGroups() === 0;
   }
+
+  /** The operator-facing view. Contains no secret and no internal identifier. */
+  status() { return buildStatus(this); }
 
   stop() { this.stopped = true; }
   close() { try { this.db.close(); } catch { /* already closed */ } }

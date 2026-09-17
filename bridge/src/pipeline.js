@@ -11,6 +11,7 @@ import { extname } from 'node:path';
 import { S } from './spool.js';
 import { hashStable, sha256Buffer } from './hash.js';
 import { PREVIEW_EXTENSIONS, RAW_EXTENSIONS } from './scanner.js';
+import { recordServerContact, recordNetworkFailure } from './status.js';
 import { TransientError, PermanentError, AuthorityError } from './client.js';
 
 // =============================================================================
@@ -135,6 +136,12 @@ export class Pipeline {
         return 'advanced';
       }
       this.spool.clearSourceMissing(row.id);
+
+      // A transient failure that never reached the server is what "offline"
+      // actually means to a photographer.
+      if (err instanceof TransientError && /network|fetch|socket|ECONN/i.test(err.message)) {
+        recordNetworkFailure(this.spool.db);
+      }
 
       const attempts = this.spool.recordFailure(row.id, err);
 
@@ -378,6 +385,7 @@ export class Pipeline {
       throw new TransientError('server stored a different preview digest');
     }
 
+    recordServerContact(this.spool.db);
     this.spool.transition(row.id, S.PREVIEW_CONFIRMED, { preview_asset_id: ack.asset_id });
   }
 
@@ -412,6 +420,7 @@ export class Pipeline {
       throw new TransientError('server stored a different master digest');
     }
 
+    recordServerContact(this.spool.db);
     this.spool.transition(row.id, S.MASTER_CONFIRMED, { master_asset_id: ack.asset_id });
   }
 

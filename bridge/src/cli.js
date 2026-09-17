@@ -4,6 +4,7 @@
 import { join } from 'node:path';
 import { homedir } from 'node:os';
 import { Bridge } from './bridge.js';
+import { renderStatus } from './status.js';
 
 function arg(name, fallback = undefined) {
   const i = process.argv.indexOf(`--${name}`);
@@ -22,7 +23,7 @@ if (!command || has('help')) {
 
   enroll --url URL --code CODE            register this installation
   run    --url URL --event ID --card DIR  shoot an event
-  status                                  what is still on this laptop
+  status [--json]                         what is happening on this laptop
 
   --home DIR              where the spool lives (default ~/.fotolab-bridge)
   --retention-hours N     delete local originals N hours after the server
@@ -40,22 +41,12 @@ if (command === 'enroll') {
 }
 
 if (command === 'status') {
-  const bridge = new Bridge({ dbFile, roots: [], eventId: '', baseUrl: 'http://unused', log });
-  const device = bridge.identity.row();
-  console.log('device :', device ? `${device.device_id ?? 'not enrolled'} (${device.status})` : 'no identity');
-  console.log('spool  :', JSON.stringify(bridge.spool.counts()));
-
-  const undelivered = bridge.spool.pending();
-  if (undelivered.length) {
-    console.log(`\n${undelivered.length} photograph(s) not yet safe on the server:`);
-    for (const r of undelivered.slice(0, 20)) {
-      console.log(`  #${r.device_sequence} ${r.state}${r.attempts ? ` (${r.attempts} attempts: ${r.last_error})` : ''}`);
-    }
-  } else {
-    console.log('everything shot on this device is confirmed on the server');
-  }
+  const bridge = new Bridge({ dbFile, roots: [], eventId: '', baseUrl: 'http://unused', log: () => {} });
+  await bridge.refreshDisk(true);
+  const status = bridge.status();
+  console.log(has('json') ? JSON.stringify(status, null, 2) : renderStatus(status));
   bridge.close();
-  process.exit(0);
+  process.exit(status.running && !status.halted ? 0 : 1);
 }
 
 if (command === 'run') {
