@@ -151,3 +151,23 @@ test('retiring a capture frees its group key for rediscovery', () => {
   assert.ok(fresh, 'the image now on disk can become its own photograph');
   assert.notEqual(fresh.id, row.id);
 });
+
+test('a master cannot be upgraded once the server has been told the digest', () => {
+  const sp = spool();
+  const row = shot(sp);
+  sp.transition(row.id, S.HASHED, { content_sha256: 'd'.repeat(64) });
+  sp.transition(row.id, S.QUEUED, { server_capture_id: 'cap-x' });
+
+  // Past this point the server holds a promise about this capture's content.
+  // Swapping the master underneath it would make the announced digest a lie.
+  assert.throws(
+    () => sp.upgradeMasterToRaw(row.id, '/card/DSC0001.CR3', '/card/DSC0001.JPG',
+                                { size: 9999, mtimeMs: Date.now() }),
+    /cannot upgrade master of a queued capture/);
+
+  const after = sp.byId(row.id);
+  assert.equal(after.master_path, '/card/DSC0001.CR3'.replace('/card/DSC0001.CR3', after.master_path),
+    'the row is untouched');
+  assert.equal(after.state, S.QUEUED);
+  assert.equal(after.content_sha256, 'd'.repeat(64), 'and its digest still stands');
+});

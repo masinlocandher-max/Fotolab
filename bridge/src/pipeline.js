@@ -7,8 +7,10 @@
 
 import { readFile, stat } from 'node:fs/promises';
 import { unlink } from 'node:fs/promises';
+import { extname } from 'node:path';
 import { S } from './spool.js';
 import { hashStable, sha256Buffer } from './hash.js';
+import { PREVIEW_EXTENSIONS, RAW_EXTENSIONS } from './scanner.js';
 import { TransientError, PermanentError, AuthorityError } from './client.js';
 
 // =============================================================================
@@ -177,6 +179,23 @@ export class Pipeline {
   // --- DISCOVERED → HASHED --------------------------------------------------
 
   async #hash(row) {
+    // Before committing to a JPEG as the master, look directly for the RAW
+    // half of the pair.
+    //
+    // The scanner would find it too, but only on a later tick — and a capture
+    // carried over from a previous run is drained to completion before that
+    // tick ever arrives, which splits one shutter press into two. Whether a
+    // photograph is one capture or two must not depend on scan timing, so the
+    // check is made here, against the filesystem, at the moment it matters.
+    if (PREVIEW_EXTENSIONS.has(extname(row.master_path).toLowerCase())) {
+      const sibling = await this.#findRawSibling(row.master_path);
+      if (sibling) {
+        this.spool.upgradeMasterToRaw(row.id, sibling.path, row.master_path, sibling.stat);
+        this.log('master-upgraded', { id: row.id, raw: sibling.path });
+        return;
+      }
+    }
+
     const result = await hashStable(row.master_path);
 
     if (result.changed) {
@@ -227,6 +246,21 @@ export class Pipeline {
       }
       throw err;
     }
+  }
+
+  /** The RAW sitting next to a JPEG, if the camera wrote one. */
+  async #findRawSibling(masterPath) {
+    const stem = masterPath.slice(0, masterPath.length - extname(masterPath).length);
+    for (const ext of RAW_EXTENSIONS) {
+      for (const cased of [ext, ext.toUpperCase()]) {
+        const candidate = stem + cased;
+        try {
+          const st = await stat(candidate);
+          if (st.isFile() && st.size > 0) return { path: candidate, stat: st };
+        } catch { /* not this one */ }
+      }
+    }
+    return null;
   }
 
   // --- HASHED → QUEUED ------------------------------------------------------

@@ -9,9 +9,12 @@ import { createHash } from 'node:crypto';
 import { randomUUID } from 'node:crypto';
 
 export class FakeServer {
-  constructor({ organizationId = 'org-a', liveEvents = ['event-a'] } = {}) {
+  constructor({ organizationId = 'org-a', liveEvents = ['event-a'], events = null } = {}) {
     this.organizationId = organizationId;
     this.liveEvents = new Set(liveEvents);
+    // event id -> owning organization. Anything not listed belongs to the
+    // default organization, which keeps the single-tenant tests unchanged.
+    this.eventOwners = new Map(Object.entries(events ?? {}));
 
     this.devices = new Map();          // device_id -> {publicKey, status, organizationId}
     this.challenges = new Map();
@@ -37,12 +40,14 @@ export class FakeServer {
     return false;
   }
 
-  enrollDevice({ label = 'bridge' } = {}) {
+  enrollDevice({ label = 'bridge', organizationId = null } = {}) {
     const code = randomUUID();
     this.pendingEnrollments ??= new Map();
-    this.pendingEnrollments.set(code, { label });
+    this.pendingEnrollments.set(code, { label, organizationId: organizationId ?? this.organizationId });
     return code;
   }
+
+  ownerOf(eventId) { return this.eventOwners.get(eventId) ?? this.organizationId; }
 
   revokeDevice(deviceId, status = 'revoked') {
     const d = this.devices.get(deviceId);
@@ -92,6 +97,9 @@ export class FakeServer {
     if (!this.liveEvents.has(s.eventId)) {
       return { error: { status: 403, code: 'event_not_live', message: 'event not live' } };
     }
+    if (this.ownerOf(s.eventId) !== d.organizationId) {
+      return { error: { status: 403, code: 'wrong_organization', message: 'cross-tenant session' } };
+    }
     s.lastSeenAt = Date.now();
     return { session: s, device: d };
   }
@@ -133,13 +141,14 @@ export class FakeServer {
     if (!this.pendingEnrollments?.has(body.enrollment_code)) {
       return this.#json(res, 403, { code: 'bad_enrollment_code' });
     }
+    const pending = this.pendingEnrollments.get(body.enrollment_code);
     this.pendingEnrollments.delete(body.enrollment_code);
     const deviceId = `dev-${randomUUID().slice(0, 8)}`;
     this.devices.set(deviceId, {
-      publicKey: body.public_key, status: 'active', organizationId: this.organizationId,
+      publicKey: body.public_key, status: 'active', organizationId: pending.organizationId,
     });
     // Server-authoritative: the Bridge gets told who it is.
-    return this.#json(res, 200, { device_id: deviceId, organization_id: this.organizationId });
+    return this.#json(res, 200, { device_id: deviceId, organization_id: pending.organizationId });
   }
 
   async #challenge(req, res) {
@@ -170,6 +179,12 @@ export class FakeServer {
     if (!ok) return this.#json(res, 403, { code: 'bad_signature' });
 
     if (!this.liveEvents.has(body.event_id)) return this.#json(res, 403, { code: 'event_not_live' });
+    // Tenancy: a device may only shoot events its own organization owns. The
+    // database enforces this too, via the composite foreign key on
+    // device_sessions; this is the application layer saying the same thing.
+    if (this.ownerOf(body.event_id) !== d.organizationId) {
+      return this.#json(res, 403, { code: 'wrong_organization' });
+    }
 
     // One live session per device, matching the database invariant in
     // migration 0007. Two clones cannot upload concurrently; each takes the

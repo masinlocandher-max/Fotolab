@@ -8,7 +8,7 @@ import { Bridge } from '../src/bridge.js';
 
 const {
   BRIDGE_DB, BRIDGE_CARD, BRIDGE_URL, BRIDGE_EVENT,
-  BRIDGE_ENROLL_CODE, BRIDGE_CHAOS_MS,
+  BRIDGE_ENROLL_CODE, BRIDGE_CHAOS_MS, BRIDGE_STOP_AT, BRIDGE_STOP_BEFORE_ENROLL,
 } = process.env;
 
 const bridge = new Bridge({
@@ -45,10 +45,46 @@ if (process.env.BRIDGE_REPORT_MEMORY) {
   memTimer.unref();
 }
 
+// Die with the keypair on disk but the enrollment unrecorded — the window in
+// which the enrollment code is already spent server-side.
+if (BRIDGE_STOP_BEFORE_ENROLL) {
+  bridge.identity.ensureKeypair();
+  process.kill(process.pid, 'SIGKILL');
+}
+
 try {
   bridge.recover();
   if (BRIDGE_ENROLL_CODE) await bridge.enrollIfNeeded(BRIDGE_ENROLL_CODE);
   process.send?.({ ready: true });
+
+  // Deterministic crash point: die the instant any capture first reaches the
+  // named state. Random kills prove crash safety in aggregate; this proves it
+  // at each specific transition, which is what "converges without operator
+  // repair" has to mean one state at a time.
+  if (BRIDGE_STOP_AT) {
+    const atTarget = () => bridge.db
+      .prepare('select count(*) n from captures where state = ?').get(BRIDGE_STOP_AT).n > 0;
+    // The scanner needs more than one tick before a file counts as settled, so
+    // quiescence is only believed after several consecutive quiet passes —
+    // otherwise the loop concludes "nothing to do" before the first capture
+    // has even been committed, and the crash point is never reached.
+    let quiet = 0;
+    for (let pass = 0; pass < 2000; pass++) {
+      await bridge.ensureSession();
+      const found = await bridge.ingestOnce();
+      if (atTarget()) process.kill(process.pid, 'SIGKILL');
+      const r = await bridge.pipeline.step();
+      if (atTarget()) process.kill(process.pid, 'SIGKILL');
+      if (r === 'halted') break;
+      if (r === 'idle' && found === 0 && bridge.isQuiescent()) {
+        if (++quiet >= 4) break;
+      } else quiet = 0;
+      await new Promise((res) => setTimeout(res, 2));
+    }
+    process.send?.({ done: true, note: 'target state never reached' });
+    bridge.close();
+    process.exit(0);
+  }
 
   // Run until killed, or until the spool is drained and quiet twice over.
   let quiet = 0;

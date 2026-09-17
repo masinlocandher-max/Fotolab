@@ -9,8 +9,8 @@
 import { readdir, stat } from 'node:fs/promises';
 import { join, extname, dirname, basename } from 'node:path';
 
-const PREVIEW_EXTENSIONS = new Set(['.jpg', '.jpeg', '.heic']);
-const RAW_EXTENSIONS = new Set(['.cr2', '.cr3', '.nef', '.arw', '.raf', '.orf', '.rw2', '.dng']);
+export const PREVIEW_EXTENSIONS = new Set(['.jpg', '.jpeg', '.heic']);
+export const RAW_EXTENSIONS = new Set(['.cr2', '.cr3', '.nef', '.arw', '.raf', '.orf', '.rw2', '.dng']);
 const DEFAULT_EXTENSIONS = new Set([...PREVIEW_EXTENSIONS, ...RAW_EXTENSIONS]);
 
 /**

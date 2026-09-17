@@ -250,6 +250,29 @@ export class Spool {
     });
   }
 
+  /**
+   * Promote a capture's master from the camera JPEG to the RAW beside it.
+   * Only legal before the capture has been announced — after that the server
+   * holds a digest we cannot retract.
+   */
+  upgradeMasterToRaw(id, rawPath, jpegPath, st) {
+    return tx(this.db, () => {
+      const row = this.db.prepare('select * from captures where id = ?').get(id);
+      if (row.state !== S.DISCOVERED && row.state !== S.HASHED) {
+        throw new Error(`cannot upgrade master of a ${row.state} capture`);
+      }
+      this.db.prepare(`
+        update captures
+           set master_path = ?, preview_path = ?, observed_size = ?, observed_mtime_ms = ?,
+               content_sha256 = null, byte_size = null,
+               preview_sha256 = null, preview_size = null,
+               state = ?, last_error = 'master upgraded to RAW; re-hashing'
+         where id = ?
+      `).run(rawPath, row.preview_path ?? jpegPath, st.size, st.mtimeMs, S.DISCOVERED, id);
+      return this.byId(id);
+    });
+  }
+
   /** Record when a source file first went missing; returns that timestamp. */
   noteSourceMissing(id) {
     return tx(this.db, () => {
