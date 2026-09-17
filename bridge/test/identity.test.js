@@ -399,6 +399,42 @@ test('IDENTITY: same filename in separate camera directories is two photographs'
   assert.equal(server.captureCount(), 2);
 });
 
+test('IDENTITY: a card pulled between hashing and announcing is not given up on', async (t) => {
+  // This rejected on the spot and kept the group key, so a reader unplugged for
+  // two seconds discarded the capture and the returning file was never
+  // rediscovered. Photographs lost by touching a cable.
+  const { bridge, server, cleanup, cards } = await makeBridge({ sourceMissingGraceMs: 60_000 });
+  t.after(() => { cleanup(); return server.close(); });
+  await enrollAndSession(bridge, server);
+
+  const p = join(cards[0], 'PULL01.JPG');
+  const body = Buffer.from('pulled-mid-flight'.padEnd(5000, 'p'));
+  writeFileSync(p, body);
+  assert.ok(await ingestUntilFound(bridge));
+  await bridge.pipeline.step();                       // hash
+  assert.equal(bridge.spool.byId(1).state, S.HASHED);
+
+  // Reader out, exactly in the pre-announce window.
+  const stash = tempDir('pull-stash-');
+  renameSync(p, join(stash, 'PULL01.JPG'));
+  await bridge.pipeline.step();                       // would have rejected
+
+  const waiting = bridge.spool.byId(1);
+  assert.notEqual(waiting.state, S.REJECTED, 'the capture is not thrown away');
+  assert.ok(waiting.source_missing_since, 'the absence is recorded and timed');
+
+  // Reader back in.
+  renameSync(join(stash, 'PULL01.JPG'), p);
+  rmSync(stash, { recursive: true, force: true });
+  bridge.db.prepare('update captures set next_attempt_at_ms = 0').run();
+  assert.ok(await settle(bridge));
+
+  assert.equal(server.confirmedMasters(), 1, 'the photograph is delivered after the card returns');
+  const { createHash } = await import('node:crypto');
+  assert.equal(server.allCaptures()[0].assets.master.sha256,
+    createHash('sha256').update(body).digest('hex'), 'byte-exact');
+});
+
 test('IDENTITY: a card that disappears and returns does not lose or duplicate work', async (t) => {
   const { bridge, server, cleanup, cards } = await makeBridge();
   t.after(() => { cleanup(); return server.close(); });

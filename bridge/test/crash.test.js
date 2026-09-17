@@ -17,18 +17,35 @@ import { tempDir } from './helpers.js';
 
 const WORKER = fileURLToPath(new URL('./worker.js', import.meta.url));
 
-function runWorker(env, { killAfterMs = null } = {}) {
+/**
+ * Run a worker, optionally killing it.
+ *
+ * `killWhen` is preferred over a fixed delay. Test files run concurrently and
+ * these tests fork heavily, so a worker can sit unscheduled through a 200ms
+ * window and be killed having done nothing — which makes the run prove nothing
+ * and, under load, fail its own anti-vacuous guard. Killing on observed
+ * progress makes the crash land on live work by construction rather than by
+ * hoping the timing holds.
+ */
+function runWorker(env, { killAfterMs = null, killWhen = null, killDeadlineMs = 8000 } = {}) {
   return new Promise((resolve) => {
     const child = fork(WORKER, [], {
       env: { ...process.env, ...env },
       stdio: ['ignore', 'ignore', 'ignore', 'ipc'],
     });
-    let killer = null;
-    if (killAfterMs != null) {
-      killer = setTimeout(() => { try { child.kill('SIGKILL'); } catch {} }, killAfterMs);
+    const timers = [];
+    const stop = () => { try { child.kill('SIGKILL'); } catch {} };
+
+    if (killWhen) {
+      const poll = setInterval(() => { if (killWhen()) { clearInterval(poll); stop(); } }, 10);
+      timers.push(poll);
+      timers.push(setTimeout(stop, killDeadlineMs));   // never hang on a stall
+    } else if (killAfterMs != null) {
+      timers.push(setTimeout(stop, killAfterMs));
     }
+
     child.on('exit', (code, signal) => {
-      if (killer) clearTimeout(killer);
+      for (const t of timers) { clearInterval(t); clearTimeout(t); }
       resolve({ code, signal });
     });
   });
@@ -71,7 +88,20 @@ test('every photograph survives repeated kill -9', { timeout: 180_000 }, async (
     server.faults.upload5xx = 1;
     if (round % 4 === 3) server.faults.dropAckAfterCommit = 1;
 
-    await runWorker(env, { killAfterMs: 40 + Math.floor(Math.random() * 260) });
+    // Kill once this round has visibly moved work, with a little jitter after
+    // that so the crash lands at varying points rather than always the same one.
+    const announcesBefore = server.counters.announce;
+    const uploadsBefore = server.counters.upload;
+    let armed = 0;
+    await runWorker(env, {
+      killWhen: () => {
+        const moved = server.counters.announce > announcesBefore
+                   || server.counters.upload > uploadsBefore;
+        if (!moved) return false;
+        if (armed === 0) armed = Date.now() + Math.floor(Math.random() * 120);
+        return Date.now() >= armed;
+      },
+    });
     // The code is retained deliberately: a Bridge killed mid-enrollment must
     // still be able to enroll, and passing the code again is exactly what an
     // operator would do. Enrollment is idempotent on the device public key.

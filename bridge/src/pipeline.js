@@ -282,14 +282,17 @@ export class Pipeline {
   async #announce(row) {
     // Cheap guard before the digest becomes a promise to the server: if size or
     // mtime moved since hashing, re-hash instead of announcing a stale digest.
-    try {
-      const st = await stat(row.master_path);
-      if (st.size !== row.observed_size || st.mtimeMs !== row.observed_mtime_ms) {
-        this.spool.transition(row.id, S.DISCOVERED, { last_error: 'changed before announce; re-hashing' });
-        return;
-      }
-    } catch {
-      this.spool.reject(row.id, 'vanished_before_announce');
+    //
+    // A file that is not there right now is deliberately NOT rejected here.
+    // This used to reject on the spot, which meant a card reader pulled for two
+    // seconds permanently discarded every capture in this window — and because
+    // the rejection kept the group key, the file coming back was never
+    // rediscovered. Photographs were lost by unplugging a cable. The error is
+    // raised instead, so the missing-source grace in step() applies: wait, then
+    // give up, then release the key.
+    const st = await stat(row.master_path);
+    if (st.size !== row.observed_size || st.mtimeMs !== row.observed_mtime_ms) {
+      this.spool.transition(row.id, S.DISCOVERED, { last_error: 'changed before announce; re-hashing' });
       return;
     }
 

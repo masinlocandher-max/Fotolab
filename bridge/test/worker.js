@@ -11,9 +11,18 @@ const {
   BRIDGE_ENROLL_CODE, BRIDGE_CHAOS_MS, BRIDGE_STOP_AT, BRIDGE_STOP_BEFORE_ENROLL,
 } = process.env;
 
+// Disk pressure is applied by moving the thresholds across the volume's real
+// free space, so the code path exercised is the real one.
+const HUGE = 2 ** 60;
+const diskThresholds = process.env.BRIDGE_DISK_CRITICAL
+  ? { criticalFreeBytes: HUGE, warningFreeBytes: HUGE, criticalFreeRatio: 0.99, warningFreeRatio: 0.99 }
+  : undefined;
+
 const bridge = new Bridge({
   dbFile: BRIDGE_DB,
   roots: [BRIDGE_CARD],
+  diskThresholds,
+  diskCheckMs: 0,
   eventId: BRIDGE_EVENT ?? 'event-a',
   baseUrl: BRIDGE_URL,
   quietMs: 0,

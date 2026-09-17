@@ -8,8 +8,11 @@
     "node": ">=22.5.0"
   },
   "scripts": {
-    "test": "node --test --no-warnings --test-timeout=60000 test/*.test.js",
+    "test": "node --test --no-warnings --test-timeout=300000 test/spool.test.js test/scenarios.test.js test/identity.test.js test/clone.test.js test/disk.test.js test/status.test.js test/multibridge.test.js test/crash.test.js test/restart.test.js",
+    "test:memory": "node --test --no-warnings --test-timeout=600000 test/memory.test.js",
+    "test:field": "node --test --no-warnings --test-timeout=1800000 test/field.test.js",
     "test:soak": "SOAK=1 node --test --no-warnings --test-timeout=900000 test/soak.test.js",
+    "qualify": "FQ_FULL=1 node --test --no-warnings --test-timeout=10800000 test/field.test.js",
     "bridge": "node --no-warnings src/cli.js"
   },
   "dependencies": {},
