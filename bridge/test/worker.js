@@ -17,6 +17,7 @@ const bridge = new Bridge({
   eventId: BRIDGE_EVENT ?? 'event-a',
   baseUrl: BRIDGE_URL,
   quietMs: 0,
+  pairGraceMs: Number(process.env.BRIDGE_PAIR_GRACE_MS ?? 0),
   pollMs: 5,
   log: (kind, data) => {
     if (process.env.BRIDGE_VERBOSE) console.error(kind, JSON.stringify(data));
@@ -45,8 +46,7 @@ try {
     } catch (err) {
       process.send?.({ error: err.message });
     }
-    const pending = bridge.spool.pending().length;
-    if (pending === 0 && found === 0) {
+    if (bridge.isQuiescent() && found === 0) {
       if (++quiet >= 3) break;
     } else quiet = 0;
     await new Promise((r) => setTimeout(r, 5));

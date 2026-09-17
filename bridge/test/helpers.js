@@ -17,7 +17,7 @@ export function writeShot(dir, name, { bytes = 2048, seed = null } = {}) {
 }
 
 /** A Bridge wired to a running FakeServer, enrolled and in session. */
-export async function makeBridge({ eventId = 'event-a', quietMs = 0, roots, server } = {}) {
+export async function makeBridge({ eventId = 'event-a', quietMs = 0, pairGraceMs = 0, sourceMissingGraceMs, roots, server } = {}) {
   const srv = server ?? new FakeServer();
   if (!srv.baseUrl) await srv.listen();
 
@@ -30,6 +30,8 @@ export async function makeBridge({ eventId = 'event-a', quietMs = 0, roots, serv
     eventId,
     baseUrl: srv.baseUrl,
     quietMs,
+    pairGraceMs,
+    sourceMissingGraceMs,
     log: () => {},
   });
 
@@ -77,7 +79,7 @@ export async function settle(bridge, rounds = 60) {
     try { await bridge.drain(200); } catch { /* offline */ }
 
     const pending = bridge.spool.pending();
-    if (pending.length === 0 && found === 0) {
+    if (pending.length === 0 && found === 0 && bridge.scanner.waitingGroups() === 0) {
       if (++quiet >= 2) return true;
     } else {
       quiet = 0;

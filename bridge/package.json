@@ -4,10 +4,12 @@
   "private": true,
   "type": "module",
   "description": "Camera-to-cloud capture bridge. Durable local spool, server-acknowledged uploads, no platform credentials.",
-  "engines": { "node": ">=22.5.0" },
+  "engines": {
+    "node": ">=22.5.0"
+  },
   "scripts": {
-    "test": "node --test --no-warnings test/",
-    "test:soak": "SOAK=1 node --test --no-warnings --test-timeout=600000 test/crash.test.js",
+    "test": "node --test --no-warnings --test-timeout=60000 test/*.test.js",
+    "test:soak": "SOAK=1 node --test --no-warnings --test-timeout=900000 test/soak.test.js",
     "bridge": "node --no-warnings src/cli.js"
   },
   "dependencies": {},

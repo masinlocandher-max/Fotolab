@@ -12,6 +12,12 @@ import { hashStable, sha256Buffer } from './hash.js';
 import { TransientError, PermanentError, AuthorityError } from './client.js';
 
 const MAX_ATTEMPTS_BEFORE_REJECT = 12;
+// How long a source file may be absent before the capture is given up on.
+// Generous on purpose: a card reader pulled for thirty seconds, a network
+// volume remounting, or a laptop waking from sleep must not cost a photograph.
+// But a file the photographer moved or deleted must not wedge the spool
+// forever either, so the wait is bounded.
+const SOURCE_MISSING_GRACE_MS = 10 * 60_000;
 // A bounded failure (checksum mismatch) gets fewer chances than a network
 // outage, which gets unlimited ones.
 const MAX_BOUNDED_ATTEMPTS = 5;
@@ -26,12 +32,18 @@ export class Pipeline {
    * @param {number} [deps.maxBytes] reject anything larger, rather than
    *   discovering the limit halfway through a venue's upload window
    */
-  constructor({ spool, client, identity, sessions, maxBytes = 512 * 1024 * 1024, log = () => {} }) {
+  constructor({
+    spool, client, identity, sessions,
+    maxBytes = 512 * 1024 * 1024,
+    sourceMissingGraceMs = SOURCE_MISSING_GRACE_MS,
+    log = () => {},
+  }) {
     this.spool = spool;
     this.client = client;
     this.identity = identity;
     this.sessions = sessions;
     this.maxBytes = maxBytes;
+    this.sourceMissingGraceMs = sourceMissingGraceMs;
     this.log = log;
   }
 
@@ -65,6 +77,21 @@ export class Pipeline {
         this.log('rejected', { id: row.id, reason: err.code ?? err.message });
         return 'advanced';
       }
+
+      // A source file that is not there right now: the card may be out, or the
+      // photographer may have moved it. Wait, then give up — and release the
+      // group key so the file, if it merely moved, is picked up where it now is.
+      if (err?.code === 'ENOENT') {
+        const since = this.spool.noteSourceMissing(row.id);
+        this.spool.recordFailure(row.id, err);
+        if (Date.now() - since > this.sourceMissingGraceMs) {
+          this.spool.rejectAndRelease(row.id, 'source_vanished',
+            { last_error: `source absent for over ${Math.round(this.sourceMissingGraceMs / 1000)}s` });
+          this.log('source-vanished', { id: row.id, path: row.master_path });
+        }
+        return 'advanced';
+      }
+      this.spool.clearSourceMissing(row.id);
 
       const attempts = this.spool.recordFailure(row.id, err);
 

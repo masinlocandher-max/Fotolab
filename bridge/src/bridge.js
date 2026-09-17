@@ -12,17 +12,19 @@ import { Pipeline } from './pipeline.js';
 export class Bridge {
   constructor({
     dbFile, roots, eventId, baseUrl, passphrase = null,
-    quietMs = 1500, pollMs = 500, fetchImpl, log = () => {},
+    quietMs = 1500, pairGraceMs = 2500, pollMs = 500,
+    sourceMissingGraceMs, fetchImpl, log = () => {},
   }) {
     this.db = openDb(dbFile);
     this.spool = new Spool(this.db);
     this.identity = new Identity(this.db, { passphrase });
     this.sessions = new SessionStore(this.db);
-    this.scanner = new Scanner({ roots, quietMs });
+    this.scanner = new Scanner({ roots, quietMs, pairGraceMs });
     this.client = new HttpClient({ baseUrl, sessionStore: this.sessions, fetchImpl });
     this.pipeline = new Pipeline({
       spool: this.spool, client: this.client,
       identity: this.identity, sessions: this.sessions, log,
+      ...(sourceMissingGraceMs != null ? { sourceMissingGraceMs } : {}),
     });
     this.eventId = eventId;
     this.pollMs = pollMs;
@@ -126,6 +128,15 @@ export class Bridge {
       }
       await new Promise((r) => setTimeout(r, this.pollMs));
     }
+  }
+
+  /**
+   * Nothing to do, and nothing about to become something to do. The scanner
+   * check is not decoration: a lone JPEG inside the pair grace window is a
+   * photograph this Bridge has seen and not yet committed.
+   */
+  isQuiescent() {
+    return this.spool.pending().length === 0 && this.scanner.waitingGroups() === 0;
   }
 
   stop() { this.stopped = true; }

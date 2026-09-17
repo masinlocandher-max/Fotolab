@@ -115,8 +115,48 @@ export function openDb(file) {
   db.exec('pragma foreign_keys = ON');
   db.exec('pragma busy_timeout = 5000');
   db.exec(SCHEMA);
+  migrate(db);
 
   return db;
+}
+
+// Columns added after the first release. `create table if not exists` will not
+// add them to a spool that already exists on a photographer's laptop, and that
+// spool may be holding an unfinished event, so it is migrated in place rather
+// than recreated.
+const ADDED_COLUMNS = [
+  ['captures', 'sibling_group_key',   'text'],
+  ['captures', 'source_missing_since', 'integer'],
+  ['captures', 'role_collision',       'integer not null default 0'],
+];
+
+function migrate(db) {
+  for (const [table, column, type] of ADDED_COLUMNS) {
+    const cols = db.prepare(`pragma table_info(${table})`).all().map((c) => c.name);
+    if (!cols.includes(column)) {
+      db.exec(`alter table ${table} add column ${column} ${type}`);
+    }
+  }
+
+  // Early spools used a NUL byte between directory and basename. SQLite
+  // truncates text at the NUL for every string operation, so those keys are
+  // unreadable and ambiguous. They are rebuilt from master_path, which is
+  // intact, rather than left for someone to repair by hand at an event.
+  const legacy = db.prepare(
+    `select id, master_path from captures where instr(group_key, char(0)) > 0 or group_key not like '%/%'`
+  ).all();
+  for (const row of legacy) {
+    const path = row.master_path;
+    const slash = path.lastIndexOf('/');
+    const dot = path.lastIndexOf('.');
+    const rebuilt = dot > slash ? path.slice(0, dot) : path;
+    try {
+      db.prepare('update captures set group_key = ? where id = ?').run(rebuilt, row.id);
+    } catch {
+      // A collision means two legacy rows shared a stem; leave the second one
+      // under its old key rather than destroying the first.
+    }
+  }
 }
 
 /**

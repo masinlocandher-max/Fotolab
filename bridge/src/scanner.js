@@ -13,11 +13,21 @@ const PREVIEW_EXTENSIONS = new Set(['.jpg', '.jpeg', '.heic']);
 const RAW_EXTENSIONS = new Set(['.cr2', '.cr3', '.nef', '.arw', '.raf', '.orf', '.rw2', '.dng']);
 const DEFAULT_EXTENSIONS = new Set([...PREVIEW_EXTENSIONS, ...RAW_EXTENSIONS]);
 
-/** (directory, basename without extension) — one press of the shutter. */
+/**
+ * (directory, basename without extension) — one press of the shutter,
+ * expressed as the file path with its extension removed.
+ *
+ * The separator is the path separator, not a NUL byte. A NUL looks like a
+ * tidy unambiguous delimiter and is not: SQLite stores the text but truncates
+ * it at the NUL for length(), LIKE, substr and concatenation, so every key in
+ * a directory reads back as the directory itself. Exact lookups still worked
+ * by accident, which is the worst kind of working — every diagnostic query,
+ * status listing and log line would have been wrong at the exact moment
+ * somebody needed one. A basename can never contain '/', so joining with it
+ * is unambiguous and stays readable.
+ */
 export function groupKeyFor(path) {
-  const dir = dirname(path);
-  const base = basename(path, extname(path));
-  return `${dir}\u0000${base}`;
+  return join(dirname(path), basename(path, extname(path)));
 }
 
 export class Scanner {
@@ -27,13 +37,40 @@ export class Scanner {
    * @param {number} opts.quietMs a file must be unchanged this long to count as
    *   finished. A camera still writing a 60MB raw must not be hashed mid-write.
    */
-  constructor({ roots, quietMs = 1500, extensions = DEFAULT_EXTENSIONS, now = () => Date.now() }) {
+  /**
+   * @param {object} opts
+   * @param {number} [opts.pairGraceMs] how long a lone JPEG waits for the RAW
+   *   its camera is probably still writing. A shutter press that produced both
+   *   should become one capture, and on a slow card the two files can be
+   *   seconds apart. Bounded, so a JPEG-only camera never waits forever.
+   */
+  constructor({
+    roots, quietMs = 1500, pairGraceMs = 8000,
+    extensions = DEFAULT_EXTENSIONS, now = () => Date.now(),
+  }) {
     this.roots = roots;
     this.quietMs = quietMs;
+    this.pairGraceMs = pairGraceMs;
     this.extensions = extensions;
     this.now = now;
     /** @type {Map<string, {size:number, mtimeMs:number, seenAt:number}>} */
     this.observations = new Map();
+    /** @type {Map<string, number>} when each group first had everything settled */
+    this.groupSettledAt = new Map();
+  }
+
+  /**
+   * Groups held back waiting for a possible RAW sibling. A caller deciding
+   * whether there is nothing left to do must ask this as well as the spool —
+   * otherwise it concludes "idle" while a photograph is still in the grace
+   * window and walks away from it.
+   */
+  waitingGroups() {
+    let n = 0;
+    for (const settledAt of this.groupSettledAt.values()) {
+      if (this.now() - settledAt < this.pairGraceMs) n++;
+    }
+    return n;
   }
 
   async #walk(dir, out) {
@@ -96,8 +133,34 @@ export class Scanner {
     for (const [groupKey, g] of groups) {
       if (g.pending > 0 || g.stable.length === 0) continue;
 
-      const raw = g.stable.find((f) => RAW_EXTENSIONS.has(f.ext));
-      const jpeg = g.stable.find((f) => PREVIEW_EXTENSIONS.has(f.ext));
+      const raws = g.stable.filter((f) => RAW_EXTENSIONS.has(f.ext));
+      const jpegs = g.stable.filter((f) => PREVIEW_EXTENSIONS.has(f.ext));
+
+      // Two files competing for the same role — IMG_0001.JPG beside
+      // IMG_0001.jpg, or a .jpg beside a .jpeg. They share a stem but they are
+      // different photographs, and picking one silently loses the other. Break
+      // the group apart and let each file be its own capture, keyed by its own
+      // path. Visibly two, rather than invisibly one.
+      if (raws.length > 1 || jpegs.length > 1) {
+        for (const f of g.stable) {
+          ready.push({
+            groupKey: f.path, masterPath: f.path,
+            previewPath: PREVIEW_EXTENSIONS.has(f.ext) ? f.path : null,
+            size: f.size, mtimeMs: f.mtimeMs, files: [f.path], roleCollision: true,
+          });
+        }
+        continue;
+      }
+
+      const raw = raws[0], jpeg = jpegs[0];
+
+      // A lone JPEG may be half of a pair whose RAW is still being written.
+      // Give the card a bounded moment before committing to JPEG-as-master.
+      if (!raw && jpeg && this.pairGraceMs > 0) {
+        const settledAt = this.groupSettledAt.get(groupKey) ?? this.now();
+        this.groupSettledAt.set(groupKey, settledAt);
+        if (this.now() - settledAt < this.pairGraceMs) continue;
+      }
 
       // The master is the highest-fidelity file present; the preview source is
       // the camera JPEG when there is one. A RAW-only capture has no preview
@@ -111,11 +174,15 @@ export class Scanner {
         size: master.size,
         mtimeMs: master.mtimeMs,
         files: g.stable.map((f) => f.path),
+        hasRaw: !!raw,
       });
     }
 
     for (const path of this.observations.keys()) {
       if (!seen.has(path)) this.observations.delete(path);
+    }
+    for (const key of this.groupSettledAt.keys()) {
+      if (!groups.has(key)) this.groupSettledAt.delete(key);
     }
 
     return ready;

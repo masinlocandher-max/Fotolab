@@ -62,35 +62,109 @@ export class Spool {
    * Returns the row, or null if this path is already known — which is how
    * duplicate filesystem notifications collapse.
    */
-  discover({ groupKey, masterPath, previewPath, eventId, size, mtimeMs, capturedAt }) {
+  discover({ groupKey, masterPath, previewPath, eventId, size, mtimeMs, capturedAt,
+             roleCollision = false, hasRaw = false }) {
     return tx(this.db, () => {
       const existing = this.db.prepare('select * from captures where group_key = ?').get(groupKey);
+
       if (existing) {
-        // A sibling that turned up after its group was already spooled — most
-        // often the RAW landing well after the JPEG on a slow card. Attach it
-        // if the capture has not yet been announced; otherwise leave it alone
-        // and let the operator see it, rather than inventing a second
-        // photograph or silently dropping the master.
-        if (previewPath && !existing.preview_path && existing.state === S.DISCOVERED) {
-          this.db.prepare('update captures set preview_path = ? where id = ?')
-            .run(previewPath, existing.id);
-        }
+        return this.#reconcileExisting(existing, {
+          groupKey, masterPath, previewPath, eventId, size, mtimeMs, capturedAt, hasRaw,
+        });
+      }
+
+      return this.#insert({
+        groupKey, masterPath, previewPath, eventId, size, mtimeMs, capturedAt, roleCollision,
+      });
+    });
+  }
+
+  #insert({ groupKey, masterPath, previewPath, eventId, size, mtimeMs, capturedAt,
+            roleCollision = false, siblingGroupKey = null }) {
+    const seq = this.#allocateSequence();
+    this.db.prepare(`
+      insert into captures
+        (idempotency_key, group_key, master_path, preview_path, event_id, device_sequence,
+         state, discovered_at, observed_size, observed_mtime_ms, stable_since_ms, captured_at,
+         role_collision, sibling_group_key)
+      values (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+    `).run(
+      randomUUID(), groupKey, masterPath, previewPath ?? null, eventId, seq, S.DISCOVERED,
+      new Date(this.now()).toISOString(), size, mtimeMs, this.now(),
+      capturedAt ?? new Date(mtimeMs).toISOString(),
+      roleCollision ? 1 : 0, siblingGroupKey
+    );
+    return this.byGroup(groupKey);
+  }
+
+  /**
+   * A group key we have seen before. Three genuinely different situations hide
+   * behind that, and collapsing them into "already known" loses photographs.
+   *
+   * They are told apart by the path, not by guesswork:
+   *
+   *   same path, different bytes      → the camera reused the filename
+   *   different path, same stem       → the other half of one shutter press
+   *   same path, same bytes           → a repeated scan; nothing to do
+   */
+  #reconcileExisting(row, incoming) {
+    const { masterPath, previewPath, size, mtimeMs, hasRaw } = incoming;
+    const preAnnounce = row.state === S.DISCOVERED || row.state === S.HASHED;
+    const isSibling = masterPath !== row.master_path;
+
+    // The RAW half of a pair, arriving after we settled on the JPEG.
+    if (isSibling && hasRaw) {
+      // Before announcing, the capture is simply upgraded: the RAW becomes the
+      // master and the JPEG the preview, which is what one shutter press
+      // always meant.
+      if (preAnnounce) {
+        this.db.prepare(`
+          update captures
+             set master_path = ?, preview_path = ?, observed_size = ?, observed_mtime_ms = ?,
+                 content_sha256 = null, byte_size = null,
+                 preview_sha256 = null, preview_size = null,
+                 state = ?, last_error = 'master upgraded to RAW; re-hashing'
+           where id = ?
+        `).run(masterPath, previewPath ?? row.preview_path, size, mtimeMs, S.DISCOVERED, row.id);
         return null;
       }
 
-      const seq = this.#allocateSequence();
+      // Too late to change what the server was told. The RAW goes up as its
+      // own capture with the relationship recorded, so the server can
+      // reconcile two rows rather than us losing a master. This is the
+      // documented cost of a RAW that lands after its JPEG was announced.
+      const own = this.db.prepare('select * from captures where group_key = ?').get(masterPath);
+      if (!own) {
+        this.#insert({ ...incoming, groupKey: masterPath, previewPath: null,
+                       siblingGroupKey: row.group_key });
+      }
+      return null;
+    }
+
+    // The JPEG half arriving after the RAW. The master path does not change —
+    // the RAW was already the master — so this is not a sibling swap, only a
+    // preview appearing. It can be attached until we have told the server what
+    // the preview digest is.
+    if (previewPath && !row.preview_path && preAnnounce) {
       this.db.prepare(`
-        insert into captures
-          (idempotency_key, group_key, master_path, preview_path, event_id, device_sequence,
-           state, discovered_at, observed_size, observed_mtime_ms, stable_since_ms, captured_at)
-        values (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
-      `).run(
-        randomUUID(), groupKey, masterPath, previewPath ?? null, eventId, seq, S.DISCOVERED,
-        new Date(this.now()).toISOString(), size, mtimeMs, this.now(),
-        capturedAt ?? new Date(mtimeMs).toISOString()
-      );
-      return this.byGroup(groupKey);
-    });
+        update captures set preview_path = ?, preview_sha256 = null, preview_size = null,
+                            state = ?
+         where id = ?
+      `).run(previewPath, S.DISCOVERED, row.id);
+      return null;
+    }
+
+    // Same path, different bytes: the counter wrapped past 9999, or the card
+    // was reformatted and reused. The finished capture keeps its history; the
+    // new photograph gets its own row rather than vanishing.
+    if (!isSibling && TERMINAL.has(row.state) &&
+        (size !== row.observed_size || mtimeMs !== row.observed_mtime_ms)) {
+      const retired = `${row.group_key}#superseded-${row.id}`;
+      this.db.prepare('update captures set group_key = ? where id = ?').run(retired, row.id);
+      return this.#insert(incoming);
+    }
+
+    return null;
   }
 
   // Sequence numbers are per-device and must never be reused, so they come from
@@ -174,6 +248,21 @@ export class Spool {
              new Date(this.now()).toISOString(), this.now() + jittered, id);
       return attempts;
     });
+  }
+
+  /** Record when a source file first went missing; returns that timestamp. */
+  noteSourceMissing(id) {
+    return tx(this.db, () => {
+      const row = this.db.prepare('select source_missing_since from captures where id = ?').get(id);
+      if (row?.source_missing_since) return row.source_missing_since;
+      const now = this.now();
+      this.db.prepare('update captures set source_missing_since = ? where id = ?').run(now, id);
+      return now;
+    });
+  }
+
+  clearSourceMissing(id) {
+    this.db.prepare('update captures set source_missing_since = null where id = ? and source_missing_since is not null').run(id);
   }
 
   clearFailure(id) {
