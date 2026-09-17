@@ -618,6 +618,168 @@ end;
 $$;
 
 -- =============================================================================
+-- Device session exclusivity and clone detection
+-- =============================================================================
+-- Enrollment recovery means two laptops holding the same keypair are the same
+-- device to the server. The invariant that stops that being silent is that a
+-- device has one live session at a time.
+
+do $$
+declare v_session uuid; v_epoch integer; v_suspect boolean;
+begin
+  select session_id, epoch, clone_suspected
+    into v_session, v_epoch, v_suspect
+  from app.open_device_session('00000000-0000-0000-0000-00000000a002',
+                               '00000000-0000-0000-0000-00000000a001');
+  perform pg_temp.ok(v_session is not null, 'a device opens an event session');
+  perform pg_temp.ok(v_suspect = false, 'and a first session raises no suspicion');
+end;
+$$;
+
+-- The database refuses a second live session, whatever the caller believes.
+select pg_temp.rejects(
+  $q$ insert into public.device_sessions (device_id, event_id, expires_at)
+      values ('00000000-0000-0000-0000-00000000a002',
+              '00000000-0000-0000-0000-00000000a001', now() + interval '8 hours') $q$,
+  'a device cannot hold two live sessions at once');
+
+-- A restart: the prior session has not been touched, so nothing is suspected.
+do $$
+declare v_suspect boolean; v_signals integer;
+begin
+  update public.device_sessions
+     set last_seen_at = now() - interval '30 minutes'
+   where device_id = '00000000-0000-0000-0000-00000000a002'
+     and revoked_at is null and superseded_at is null;
+
+  select clone_suspected into v_suspect
+  from app.open_device_session('00000000-0000-0000-0000-00000000a002',
+                               '00000000-0000-0000-0000-00000000a001');
+  select clone_signal_count into v_signals
+  from public.devices where id = '00000000-0000-0000-0000-00000000a002';
+
+  perform pg_temp.ok(v_suspect = false, 'a crash-restart is not mistaken for a clone');
+  perform pg_temp.ok(v_signals = 0, 'and raises no clone signal');
+end;
+$$;
+
+do $$
+declare n integer;
+begin
+  select count(*) into n from public.device_sessions
+   where device_id = '00000000-0000-0000-0000-00000000a002'
+     and revoked_at is null and superseded_at is null;
+  perform pg_temp.ok(n = 1, 'exactly one session survives the restart');
+end;
+$$;
+
+-- Two clones fighting: each takes the session from an installation that was
+-- uploading moments ago.
+do $$
+declare v_suspect boolean; i integer;
+begin
+  for i in 1..3 loop
+    update public.device_sessions set last_seen_at = now()
+     where device_id = '00000000-0000-0000-0000-00000000a002'
+       and revoked_at is null and superseded_at is null;
+    select clone_suspected into v_suspect
+    from app.open_device_session('00000000-0000-0000-0000-00000000a002',
+                                 '00000000-0000-0000-0000-00000000a001');
+  end loop;
+  perform pg_temp.ok(v_suspect = true,
+    'repeatedly taking a session from a working installation is flagged as a clone');
+end;
+$$;
+
+do $$
+declare n integer;
+begin
+  select count(*) into n from public.device_sessions
+   where device_id = '00000000-0000-0000-0000-00000000a002' and superseded_by is not null;
+  perform pg_temp.ok(n >= 3, 'each supersession names the session that replaced it');
+end;
+$$;
+
+-- A device may not open a session against another organization's event, even
+-- with a valid identity. Two layers stop this and the test names both, because
+-- mutating the application check alone does not turn the suite red — the
+-- composite foreign key catches it regardless, which is the point of having it.
+select pg_temp.rejects(
+  $q$ select app.open_device_session('00000000-0000-0000-0000-00000000a002',
+                                     '00000000-0000-0000-0000-00000000b001') $q$,
+  'a device cannot open a session on another organization''s event');
+
+select pg_temp.rejects(
+  $q$ insert into public.device_sessions (device_id, event_id, organization_id, expires_at)
+      values ('00000000-0000-0000-0000-00000000a002',
+              '00000000-0000-0000-0000-00000000b001',
+              '00000000-0000-0000-0000-00000000a000', now() + interval '1 hour') $q$,
+  'and the composite foreign key refuses it even bypassing open_device_session');
+
+-- Accepting the suspicion kills every session at once.
+do $$
+declare n integer; v_status public.device_status;
+begin
+  perform app.resolve_clone_suspicion('00000000-0000-0000-0000-00000000a002', 'compromised');
+  select count(*) into n from public.device_sessions
+   where device_id = '00000000-0000-0000-0000-00000000a002' and revoked_at is null;
+  select status into v_status from public.devices where id = '00000000-0000-0000-0000-00000000a002';
+  perform pg_temp.ok(n = 0, 'declaring a device compromised revokes all its sessions');
+  perform pg_temp.ok(v_status = 'compromised', 'and records the reason it was stopped');
+end;
+$$;
+
+select pg_temp.rejects(
+  $q$ select app.open_device_session('00000000-0000-0000-0000-00000000a002',
+                                     '00000000-0000-0000-0000-00000000a001') $q$,
+  'a compromised device cannot open a new session');
+
+-- -----------------------------------------------------------------------------
+-- The exact executable surface of schema `app`.
+--
+-- Asserted directly rather than through rejects(), which would pass on any
+-- error at all — including the wrong one. PostgreSQL grants EXECUTE to PUBLIC
+-- by default, so "revoke from anon" is not the same as "anon cannot call it",
+-- and this is the assertion that tells the difference.
+-- -----------------------------------------------------------------------------
+
+do $$
+declare
+  fn text;
+  exposed text[] := array[]::text[];
+  -- The only two functions the Data API is allowed to reach: read-only
+  -- membership predicates that every org-scoped RLS policy calls.
+  allowed text[] := array['is_org_member', 'has_org_role'];
+begin
+  for fn in
+    select p.oid::regprocedure::text
+    from pg_proc p join pg_namespace n on n.oid = p.pronamespace
+    where n.nspname = 'app'
+  loop
+    if has_function_privilege('anon', fn, 'execute') then
+      exposed := exposed || ('anon:' || fn);
+    end if;
+    if has_function_privilege('authenticated', fn, 'execute')
+       and not (split_part(split_part(fn, '(', 1), '.', 2) = any(allowed)) then
+      exposed := exposed || ('authenticated:' || fn);
+    end if;
+  end loop;
+
+  perform pg_temp.ok(cardinality(exposed) = 0,
+    'schema app exposes nothing to the Data API beyond the membership predicates'
+    || coalesce(' (exposed: ' || array_to_string(exposed, ', ') || ')', ''));
+end;
+$$;
+
+do $$
+begin
+  perform pg_temp.ok(
+    has_function_privilege('authenticated', 'app.is_org_member(uuid)', 'execute'),
+    'and the membership predicates RLS depends on are explicitly granted');
+end;
+$$;
+
+-- =============================================================================
 -- Attack: cross-tenant breakout via object id substitution
 -- =============================================================================
 -- Studio B's owner authenticates honestly and then submits Studio A's ids.

@@ -68,6 +68,11 @@ export class Pipeline {
         if (err.code === 'device_revoked' || err.code === 'device_compromised') {
           this.identity.markRevoked(err.code === 'device_compromised' ? 'compromised' : 'revoked');
         }
+        if (err.code === 'session_superseded') {
+          // Not ours to resolve here: the run loop decides whether this was a
+          // restart race or a second machine holding the same identity.
+          this.lastAuthorityCode = err.code;
+        }
         if (err.code?.startsWith('session')) this.sessions.clear();
         return 'halted';
       }

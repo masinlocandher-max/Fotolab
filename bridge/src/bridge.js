@@ -30,6 +30,15 @@ export class Bridge {
     this.pollMs = pollMs;
     this.log = log;
     this.stopped = false;
+
+    // How many times this process will re-open a session that something else
+    // took from it. One is an ordinary restart race. Repeatedly losing the
+    // session to another installation is two machines holding one identity,
+    // and the correct response is to stop and say so — not to win the fight,
+    // which would just produce an upload storm and corrupt nobody's benefit.
+    this.maxSessionTakeovers = 2;
+    this.sessionTakeovers = 0;
+    this.haltReason = null;
   }
 
   /** Called once at startup: rewind rows that a crash caught mid-flight. */
@@ -66,6 +75,7 @@ export class Bridge {
   }
 
   async ensureSession() {
+    if (this.haltReason) throw new AuthorityError(this.haltReason, { code: this.haltReason });
     if (this.sessions.isLive()) return true;
 
     const device = this.identity.row();
@@ -85,8 +95,32 @@ export class Bridge {
       sessionId: s.session_id, eventId: s.event_id,
       organizationId: s.organization_id, token: s.token, expiresAt: s.expires_at,
     });
+    if (s.clone_suspected) {
+      this.haltReason = 'clone_suspected';
+      this.log('clone-suspected', {
+        message: 'the server reports another installation using this device identity',
+      });
+    }
     this.log('session', { eventId: s.event_id, expiresAt: s.expires_at });
     return true;
+  }
+
+  /**
+   * Another installation took this device's session. Called from the run loop
+   * rather than handled silently, because the honest outcomes are "a laptop
+   * restarted" (retry once) and "somebody copied the Bridge" (stop).
+   */
+  noteSessionTakeover() {
+    this.sessions.clear();
+    this.sessionTakeovers += 1;
+    if (this.sessionTakeovers > this.maxSessionTakeovers) {
+      this.haltReason = 'session_contended';
+      this.log('halted', {
+        reason: 'session_contended',
+        message: 'this device identity is in use by another installation; not competing for it',
+      });
+    }
+    return this.haltReason;
   }
 
   /** One scan pass: commit every settled capture group to the spool first. */
@@ -114,20 +148,41 @@ export class Bridge {
   async runOnce() {
     await this.ensureSession();
     await this.ingestOnce();
-    return this.drain();
+    const steps = await this.drain();
+    // drain() swallows an authority failure into 'halted' so the spool is left
+    // alone; the loop still needs to know which authority failed.
+    const code = this.pipeline.lastAuthorityCode;
+    if (code) {
+      this.pipeline.lastAuthorityCode = null;
+      const err = new Error(code);
+      err.code = code;
+      throw err;
+    }
+    return steps;
   }
 
-  async run() {
+  /**
+   * @param {object} [opts]
+   * @param {number} [opts.maxCycles] stop after this many passes. Exists so the
+   *   loop's own error handling — which is where session contention is
+   *   resolved — can be tested rather than only the pieces it calls.
+   */
+  async run({ maxCycles = Infinity } = {}) {
     this.recover();
-    while (!this.stopped) {
+    let cycles = 0;
+    while (!this.stopped && cycles < maxCycles) {
+      cycles++;
       try {
         await this.runOnce();
       } catch (err) {
+        if (err?.code === 'session_superseded') this.noteSessionTakeover();
         // Nothing here may lose spool state: an outage is a pause, not a loss.
         this.log('cycle-error', { error: err.message });
       }
+      if (this.haltReason) break;
       await new Promise((r) => setTimeout(r, this.pollMs));
     }
+    return { cycles, haltReason: this.haltReason };
   }
 
   /**

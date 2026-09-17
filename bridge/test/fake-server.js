@@ -15,7 +15,8 @@ export class FakeServer {
 
     this.devices = new Map();          // device_id -> {publicKey, status, organizationId}
     this.challenges = new Map();
-    this.sessions = new Map();         // token -> {deviceId, eventId, expiresAt}
+    this.sessions = new Map();         // token -> {deviceId, eventId, expiresAt, ...}
+    this.cloneSignals = new Map();     // deviceId -> count of active-session takeovers
     this.capturesByKey = new Map();    // idempotency_key -> capture
     this.captures = new Map();         // capture_id -> capture
     this.sequences = new Set();        // `${deviceId}:${seq}`
@@ -77,6 +78,12 @@ export class FakeServer {
     const token = h.startsWith('Bearer ') ? h.slice(7) : null;
     const s = token ? this.sessions.get(token) : null;
     if (!s) return { error: { status: 401, code: 'session_expired', message: 'no session' } };
+    // A session another installation took over. Distinct from expiry: nothing
+    // timed out, somebody else claimed this device's identity.
+    if (s.supersededAt) {
+      return { error: { status: 409, code: 'session_superseded',
+                        message: 'another installation opened a session for this device' } };
+    }
     if (s.expiresAt <= Date.now()) return { error: { status: 401, code: 'session_expired', message: 'expired' } };
     const d = this.devices.get(s.deviceId);
     if (!d || d.status !== 'active') {
@@ -85,6 +92,7 @@ export class FakeServer {
     if (!this.liveEvents.has(s.eventId)) {
       return { error: { status: 403, code: 'event_not_live', message: 'event not live' } };
     }
+    s.lastSeenAt = Date.now();
     return { session: s, device: d };
   }
 
@@ -163,12 +171,36 @@ export class FakeServer {
 
     if (!this.liveEvents.has(body.event_id)) return this.#json(res, 403, { code: 'event_not_live' });
 
+    // One live session per device, matching the database invariant in
+    // migration 0007. Two clones cannot upload concurrently; each takes the
+    // session from the other, and taking it from an installation that was
+    // working moments ago is what distinguishes a clone from a restart.
+    const ACTIVITY_WINDOW_MS = 90_000;
+    let signalled = false;
+    for (const [tok, prior] of this.sessions) {
+      if (prior.deviceId !== body.device_id || prior.supersededAt) continue;
+      const lastActive = prior.lastSeenAt ?? prior.issuedAt;
+      if (Date.now() - lastActive < ACTIVITY_WINDOW_MS) signalled = true;
+      prior.supersededAt = Date.now();
+      this.sessions.set(tok, prior);
+    }
+    if (signalled) {
+      const n = (this.cloneSignals.get(body.device_id) ?? 0) + 1;
+      this.cloneSignals.set(body.device_id, n);
+      if (n >= 3) d.cloneSuspected = true;
+    }
+
     const token = randomUUID();
     const expiresAt = Date.now() + 8 * 3600_000;
-    this.sessions.set(token, { deviceId: body.device_id, eventId: body.event_id, expiresAt, sessionId: randomUUID() });
+    this.sessions.set(token, {
+      deviceId: body.device_id, eventId: body.event_id, expiresAt,
+      sessionId: randomUUID(), issuedAt: Date.now(), lastSeenAt: Date.now(),
+      supersededAt: null,
+    });
     return this.#json(res, 200, {
       session_id: randomUUID(), token, event_id: body.event_id,
       organization_id: d.organizationId, expires_at: new Date(expiresAt).toISOString(),
+      clone_suspected: !!d.cloneSuspected,
     });
   }
 
@@ -269,6 +301,12 @@ export class FakeServer {
   }
 
   // --- assertions for tests -------------------------------------------------
+
+  liveSessionsFor(deviceId) {
+    return [...this.sessions.values()].filter(
+      (s) => s.deviceId === deviceId && !s.supersededAt && s.expiresAt > Date.now());
+  }
+  cloneSuspected(deviceId) { return !!this.devices.get(deviceId)?.cloneSuspected; }
 
   allCaptures() { return [...this.captures.values()]; }
   captureCount() { return this.captures.size; }

@@ -33,7 +33,8 @@ export class AuthorityError extends Error {
 
 const AUTHORITY_CODES = new Set([
   'device_revoked', 'device_compromised', 'session_expired',
-  'session_revoked', 'event_not_live', 'wrong_organization', 'wrong_event',
+  'session_revoked', 'session_superseded',
+  'event_not_live', 'wrong_organization', 'wrong_event',
 ]);
 
 export function classify(status, code, message) {
