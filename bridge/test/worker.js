@@ -30,6 +30,21 @@ if (BRIDGE_CHAOS_MS) {
   setTimeout(() => process.kill(process.pid, 'SIGKILL'), Number(BRIDGE_CHAOS_MS));
 }
 
+// Peak RSS, sampled from inside the process that is actually doing the work.
+// Measured rather than reasoned about: uploads buffer whole files, and whether
+// that is defensible on a photographer's laptop is a number, not an opinion.
+let peakRss = 0;
+let memTimer = null;
+if (process.env.BRIDGE_REPORT_MEMORY) {
+  const sample = () => {
+    const rss = process.memoryUsage().rss;
+    if (rss > peakRss) peakRss = rss;
+  };
+  sample();
+  memTimer = setInterval(sample, 10);
+  memTimer.unref();
+}
+
 try {
   bridge.recover();
   if (BRIDGE_ENROLL_CODE) await bridge.enrollIfNeeded(BRIDGE_ENROLL_CODE);
@@ -51,7 +66,11 @@ try {
     } else quiet = 0;
     await new Promise((r) => setTimeout(r, 5));
   }
-  process.send?.({ done: true, counts: bridge.spool.counts() });
+  if (memTimer) clearInterval(memTimer);
+  process.send?.({
+    done: true, counts: bridge.spool.counts(),
+    peakRssBytes: peakRss, heapTotalBytes: process.memoryUsage().heapTotal,
+  });
   bridge.close();
   process.exit(0);
 } catch (err) {

@@ -11,6 +11,42 @@ import { S } from './spool.js';
 import { hashStable, sha256Buffer } from './hash.js';
 import { TransientError, PermanentError, AuthorityError } from './client.js';
 
+// =============================================================================
+// The memory envelope, and the file-size ceiling derived from it.
+// =============================================================================
+// Uploads buffer whole files. That was a correctness choice — a consumed
+// stream cannot be retried, and silently re-sending an empty body is worse
+// than the memory cost — and it is kept, but it has to be bounded by a number
+// rather than by optimism.
+//
+// Measured on this implementation (bridge/test/memory.test.js and the scaling
+// probe recorded in docs/field-qualification.md), a single file under a retry
+// storm costs roughly:
+//
+//     peak RSS  ~=  150 MiB baseline  +  3.6 x file size
+//
+//      60 MiB file -> 389 MiB      120 MiB file -> 474 MiB
+//     200 MiB file -> 720 MiB
+//
+// The envelope is 1 GiB: a photographer's laptop is commonly 8 GB with
+// Lightroom and a browser already open, and the Bridge's share has to be
+// small enough to be uninteresting.
+//
+// Solving the relation for the envelope gives roughly 240 MiB. The shipped
+// ceiling is 192 MiB, which keeps a margin and still clears every RAW format
+// in ordinary use (a 61MP full-frame RAW is around 70-120 MiB).
+//
+// A file above the ceiling is rejected before it is read, with a reason the
+// operator can act on. That is deliberately not silent and deliberately not a
+// crash: exceeding the envelope would invite the OOM killer, and a Bridge
+// killed by the OOM killer restarts and meets the same file again — an event
+// that stalls forever on one photograph. Resumable multipart upload is the
+// named follow-up that lifts this ceiling properly.
+export const MEMORY_ENVELOPE_BYTES = 1024 * 1024 ** 2;
+export const MEASURED_RSS_BASELINE_BYTES = 150 * 1024 ** 2;
+export const MEASURED_RSS_PER_FILE_BYTE = 3.6;
+export const DEFAULT_MAX_BYTES = 192 * 1024 ** 2;
+
 const MAX_ATTEMPTS_BEFORE_REJECT = 12;
 // How long a source file may be absent before the capture is given up on.
 // Generous on purpose: a card reader pulled for thirty seconds, a network
@@ -34,7 +70,7 @@ export class Pipeline {
    */
   constructor({
     spool, client, identity, sessions,
-    maxBytes = 512 * 1024 * 1024,
+    maxBytes = DEFAULT_MAX_BYTES,
     sourceMissingGraceMs = SOURCE_MISSING_GRACE_MS,
     log = () => {},
   }) {

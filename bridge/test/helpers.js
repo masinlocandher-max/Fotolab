@@ -17,7 +17,7 @@ export function writeShot(dir, name, { bytes = 2048, seed = null } = {}) {
 }
 
 /** A Bridge wired to a running FakeServer, enrolled and in session. */
-export async function makeBridge({ eventId = 'event-a', quietMs = 0, pairGraceMs = 0, sourceMissingGraceMs, roots, server } = {}) {
+export async function makeBridge({ eventId = 'event-a', quietMs = 0, pairGraceMs = 0, sourceMissingGraceMs, diskThresholds, diskCheckMs = 0, roots, server } = {}) {
   const srv = server ?? new FakeServer();
   if (!srv.baseUrl) await srv.listen();
 
@@ -32,6 +32,8 @@ export async function makeBridge({ eventId = 'event-a', quietMs = 0, pairGraceMs
     quietMs,
     pairGraceMs,
     sourceMissingGraceMs,
+    diskThresholds,
+    diskCheckMs,
     log: () => {},
   });
 

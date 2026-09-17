@@ -8,12 +8,15 @@ import { Identity, SessionStore } from './identity.js';
 import { Scanner } from './scanner.js';
 import { HttpClient, AuthorityError } from './client.js';
 import { Pipeline } from './pipeline.js';
+import { checkDisk, DISK, DEFAULT_THRESHOLDS, mayIngest } from './disk.js';
+import { dirname } from 'node:path';
 
 export class Bridge {
   constructor({
     dbFile, roots, eventId, baseUrl, passphrase = null,
     quietMs = 1500, pairGraceMs = 2500, pollMs = 500,
-    sourceMissingGraceMs, fetchImpl, log = () => {},
+    sourceMissingGraceMs, diskThresholds = DEFAULT_THRESHOLDS, diskCheckMs = 15_000,
+    fetchImpl, log = () => {},
   }) {
     this.db = openDb(dbFile);
     this.spool = new Spool(this.db);
@@ -39,6 +42,23 @@ export class Bridge {
     this.maxSessionTakeovers = 2;
     this.sessionTakeovers = 0;
     this.haltReason = null;
+
+    // The volume that matters is the one holding the spool: if that fills,
+    // the Bridge cannot record that a photograph exists.
+    this.spoolVolume = dirname(dbFile);
+    this.diskThresholds = diskThresholds;
+    this.diskCheckMs = diskCheckMs;
+    this.disk = { state: DISK.UNKNOWN, reason: 'not checked yet', checkedAt: 0 };
+  }
+
+  /** Cached so a fast poll loop does not statfs on every pass. */
+  async refreshDisk(force = false) {
+    if (!force && Date.now() - this.disk.checkedAt < this.diskCheckMs) return this.disk;
+    const result = await checkDisk(this.spoolVolume, this.diskThresholds);
+    const changed = result.state !== this.disk.state;
+    this.disk = { ...result, checkedAt: Date.now() };
+    if (changed) this.log('disk', { state: result.state, reason: result.reason });
+    return this.disk;
   }
 
   /** Called once at startup: rewind rows that a crash caught mid-flight. */
@@ -123,8 +143,32 @@ export class Bridge {
     return this.haltReason;
   }
 
-  /** One scan pass: commit every settled capture group to the spool first. */
+  /**
+   * One scan pass: commit every settled capture group to the spool first.
+   *
+   * Refuses to take on new photographs when the spool volume cannot be
+   * trusted to hold them. Discovering a capture we cannot durably record is
+   * worse than not discovering it: the file stays safely on the card either
+   * way, but a half-recorded capture is a lie about what we are responsible
+   * for. Draining continues regardless — that is how the backlog shrinks.
+   */
   async ingestOnce() {
+    const disk = await this.refreshDisk();
+    if (!mayIngest(disk.state)) {
+      if (!this.ingestPaused) {
+        this.ingestPaused = true;
+        this.log('ingest-paused', {
+          state: disk.state, reason: disk.reason,
+          message: 'not accepting new photographs; already-spooled work continues',
+        });
+      }
+      return 0;
+    }
+    if (this.ingestPaused) {
+      this.ingestPaused = false;
+      this.log('ingest-resumed', { state: disk.state, reason: disk.reason });
+    }
+
     const groups = await this.scanner.scan();
     let n = 0;
     for (const g of groups) {
